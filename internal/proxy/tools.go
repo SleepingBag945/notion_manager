@@ -611,6 +611,7 @@ func injectToolsIntoMessages(messages []ChatMessage, tools []Tool, model string,
 			// This prevents cross-query pollution in interactive mode.
 			var lastRoundResults strings.Builder
 			var prevRoundSummary strings.Builder
+			needsReadNarrowing := false
 			// Find the last assistant message in the current chain
 			lastAssistantIdx := -1
 			for i := len(messages) - 1; i >= 0; i-- {
@@ -627,6 +628,9 @@ func injectToolsIntoMessages(messages []ChatMessage, tools []Tool, model string,
 				if i > lastAssistantIdx && lastAssistantIdx >= 0 {
 					// Latest round: include full content
 					content := m.Content
+					if name == "Read" && strings.Contains(content, "exceeds maximum allowed tokens") {
+						needsReadNarrowing = true
+					}
 					if len(content) > 800 {
 						content = content[:800] + "..."
 					}
@@ -657,9 +661,13 @@ func injectToolsIntoMessages(messages []ChatMessage, tools []Tool, model string,
 			if extractedCwd != "" {
 				cwdLine = fmt.Sprintf("Working directory: %s\n", extractedCwd)
 			}
+			readGuardLine := ""
+			if needsReadNarrowing {
+				readGuardLine = "The previous Read call was too large. Do NOT repeat the same full-file Read. Use Grep to narrow scope or call Read with both offset and limit.\n"
+			}
 			collapsed := fmt.Sprintf(
-				"I'm writing a unit test for an API router.\n%sAvailable functions:\n%s- __done__(result: str) — call when no more steps needed\nOutput format: {\"name\": \"function_name\", \"arguments\": {...}}\n\nAlready executed (do NOT re-run):\n%s\n\nInput: \"%s\"\n\nIf the results above answer the input, output: {\"name\": \"__done__\", \"arguments\": {\"result\": \"natural language answer based on results\"}}\nOtherwise output the JSON for the NEXT DIFFERENT function call.",
-				cwdLine, compactList, dataStr, userQuery)
+				"I'm writing a unit test for an API router.\n%s%sAvailable functions:\n%s- __done__(result: str) — call when no more steps needed\nOutput format: {\"name\": \"function_name\", \"arguments\": {...}}\n\nAlready executed (do NOT re-run):\n%s\n\nInput: \"%s\"\n\nIf the results above answer the input, output: {\"name\": \"__done__\", \"arguments\": {\"result\": \"natural language answer based on results\"}}\nOtherwise output the JSON for the NEXT DIFFERENT function call.",
+				cwdLine, readGuardLine, compactList, dataStr, userQuery)
 			log.Printf("[bridge] chain: collapsed %d messages to single message (%d chars)", len(messages), len(collapsed))
 			return []ChatMessage{{Role: "user", Content: collapsed}}
 		}
@@ -792,7 +800,7 @@ func injectToolsIntoMessages(messages []ChatMessage, tools []Tool, model string,
 						break
 					}
 				}
-					if !merged {
+				if !merged {
 					// Fallback: emit as user message
 					if i+1 >= len(messages) {
 						var fallbackContent string
@@ -948,12 +956,16 @@ func buildSessionChainFollowUp(messages []ChatMessage, compactList string, cwd s
 	// Collect latest tool results (after the last assistant message)
 	var results strings.Builder
 	resultCount := 0
+	needsReadNarrowing := false
 	for i, m := range messages {
 		if m.Role != "tool" || i <= lastAssistantIdx {
 			continue
 		}
 		name := resolveName(m)
 		content := m.Content
+		if name == "Read" && strings.Contains(content, "exceeds maximum allowed tokens") {
+			needsReadNarrowing = true
+		}
 		if len(content) > 4000 {
 			content = content[:4000] + "\n... (truncated)"
 		}
@@ -968,10 +980,14 @@ func buildSessionChainFollowUp(messages []ChatMessage, compactList string, cwd s
 	if cwd != "" {
 		cwdLine = fmt.Sprintf("Working directory: %s\n", cwd)
 	}
+	readGuardLine := ""
+	if needsReadNarrowing {
+		readGuardLine = "The previous Read call was too large. Do NOT repeat the same full-file Read. Use Grep to narrow scope or call Read with both offset and limit.\n"
+	}
 
 	followUp := fmt.Sprintf(
-		"Results from executed function(s):\n%s\n\n%sAvailable functions:\n%s- __done__(result: str) — call when no more steps needed\nOutput format: {\"name\": \"function_name\", \"arguments\": {...}}\nIf these results answer the question, use __done__. Otherwise output the next function call.",
-		results.String(), cwdLine, compactList)
+		"Results from executed function(s):\n%s\n\n%s%sAvailable functions:\n%s- __done__(result: str) — call when no more steps needed\nOutput format: {\"name\": \"function_name\", \"arguments\": {...}}\nIf these results answer the question, use __done__. Otherwise output the next function call.",
+		results.String(), cwdLine, readGuardLine, compactList)
 
 	log.Printf("[bridge] session chain: follow-up for partial transcript (%d chars, %d tool results)",
 		len(followUp), resultCount)

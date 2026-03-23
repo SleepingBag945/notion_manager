@@ -357,18 +357,21 @@ func streamWebSearch(w http.ResponseWriter, flusher http.Flusher, acc *Account, 
 
 // AnthropicRequest represents an Anthropic Messages API request
 type AnthropicRequest struct {
-	Model         string             `json:"model"`
-	MaxTokens     int                `json:"max_tokens"`
-	System        interface{}        `json:"system,omitempty"`
-	Messages      []AnthropicMessage `json:"messages"`
-	Stream        bool               `json:"stream"`
-	Temperature   *float64           `json:"temperature,omitempty"`
-	TopP          *float64           `json:"top_p,omitempty"`
-	TopK          *int               `json:"top_k,omitempty"`
-	StopSequences []string           `json:"stop_sequences,omitempty"`
-	Tools         []AnthropicTool    `json:"tools,omitempty"`
-	ToolChoice    interface{}        `json:"tool_choice,omitempty"`
-	Thinking      interface{}        `json:"thinking,omitempty"`
+	Model             string                 `json:"model"`
+	MaxTokens         int                    `json:"max_tokens"`
+	System            interface{}            `json:"system,omitempty"`
+	Messages          []AnthropicMessage     `json:"messages"`
+	Stream            bool                   `json:"stream"`
+	Temperature       *float64               `json:"temperature,omitempty"`
+	TopP              *float64               `json:"top_p,omitempty"`
+	TopK              *int                   `json:"top_k,omitempty"`
+	StopSequences     []string               `json:"stop_sequences,omitempty"`
+	Tools             []AnthropicTool        `json:"tools,omitempty"`
+	ToolChoice        interface{}            `json:"tool_choice,omitempty"`
+	Thinking          interface{}            `json:"thinking,omitempty"`
+	OutputConfig      *AnthropicOutputConfig `json:"output_config,omitempty"`
+	Metadata          map[string]interface{} `json:"metadata,omitempty"`
+	ContextManagement interface{}            `json:"context_management,omitempty"`
 }
 
 // AnthropicMessage represents a message in Anthropic format
@@ -398,6 +401,16 @@ type AnthropicTool struct {
 	InputSchema interface{} `json:"input_schema,omitempty"`
 }
 
+type AnthropicOutputConfig struct {
+	Format *AnthropicOutputFormat `json:"format,omitempty"`
+	Effort string                 `json:"effort,omitempty"`
+}
+
+type AnthropicOutputFormat struct {
+	Type   string      `json:"type,omitempty"`
+	Schema interface{} `json:"schema,omitempty"`
+}
+
 // AnthropicResponse represents a non-streaming Anthropic Messages API response
 type AnthropicResponse struct {
 	ID           string                  `json:"id"`
@@ -414,6 +427,122 @@ type AnthropicResponse struct {
 type AnthropicUsage struct {
 	InputTokens  int `json:"input_tokens"`
 	OutputTokens int `json:"output_tokens"`
+}
+
+func extractAnthropicSessionSalt(metadata map[string]interface{}) string {
+	if len(metadata) == 0 {
+		return ""
+	}
+
+	extractFromValue := func(v interface{}) string {
+		switch tv := v.(type) {
+		case string:
+			trimmed := strings.TrimSpace(tv)
+			if trimmed == "" {
+				return ""
+			}
+			var parsed map[string]interface{}
+			if json.Unmarshal([]byte(trimmed), &parsed) == nil {
+				if sid, ok := parsed["session_id"].(string); ok && sid != "" {
+					return sid
+				}
+			}
+			return ""
+		case map[string]interface{}:
+			if sid, ok := tv["session_id"].(string); ok && sid != "" {
+				return sid
+			}
+		}
+		return ""
+	}
+
+	for _, key := range []string{"session_id", "conversation_id", "user_id"} {
+		if sid := extractFromValue(metadata[key]); sid != "" {
+			return sid
+		}
+	}
+	return ""
+}
+
+func stripStructuredOutputSystemNoise(content string) string {
+	content = normalizeSessionSystemContent(content)
+	if content == "" {
+		return ""
+	}
+	lines := strings.Split(content, "\n")
+	filtered := make([]string, 0, len(lines))
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			filtered = append(filtered, "")
+			continue
+		}
+		if strings.HasPrefix(trimmed, "You are Claude Code") {
+			continue
+		}
+		filtered = append(filtered, line)
+	}
+	return strings.TrimSpace(strings.Join(filtered, "\n"))
+}
+
+func applyStructuredOutputBridge(messages []ChatMessage, outputConfig *AnthropicOutputConfig) []ChatMessage {
+	if outputConfig == nil || outputConfig.Format == nil || outputConfig.Format.Type != "json_schema" || outputConfig.Format.Schema == nil {
+		return messages
+	}
+
+	schemaJSON, err := json.MarshalIndent(outputConfig.Format.Schema, "", "  ")
+	if err != nil {
+		schemaJSON, _ = json.Marshal(outputConfig.Format.Schema)
+	}
+
+	var instructionParts []string
+	var conversationParts []string
+	for _, msg := range messages {
+		content := strings.TrimSpace(msg.Content)
+		if content == "" {
+			continue
+		}
+		switch msg.Role {
+		case "system":
+			cleaned := stripStructuredOutputSystemNoise(content)
+			if cleaned != "" {
+				instructionParts = append(instructionParts, cleaned)
+			}
+		case "user":
+			cleaned := stripSystemReminders(content)
+			if cleaned == "" {
+				cleaned = content
+			}
+			conversationParts = append(conversationParts, "User:\n"+cleaned)
+		case "assistant":
+			conversationParts = append(conversationParts, "Assistant:\n"+content)
+		case "tool":
+			conversationParts = append(conversationParts, "Tool result:\n"+content)
+		}
+	}
+
+	if len(conversationParts) == 0 {
+		return messages
+	}
+
+	var prompt strings.Builder
+	prompt.WriteString("Return exactly one JSON object that matches this schema.\n")
+	prompt.WriteString("Do not output markdown fences, explanations, or extra text.\n\n")
+	prompt.WriteString("Schema:\n")
+	prompt.Write(schemaJSON)
+	if len(instructionParts) > 0 {
+		prompt.WriteString("\n\nInstructions:\n")
+		prompt.WriteString(strings.Join(instructionParts, "\n\n"))
+	}
+	prompt.WriteString("\n\nConversation:\n")
+	prompt.WriteString(strings.Join(conversationParts, "\n\n"))
+	prompt.WriteString("\n\nJSON only.")
+
+	log.Printf("[bridge] structured output bridge applied (json_schema, %d chars)", prompt.Len())
+	return []ChatMessage{{
+		Role:    "user",
+		Content: prompt.String(),
+	}}
 }
 
 // SSE events are constructed using maps for precise JSON field control
@@ -470,6 +599,10 @@ func HandleAnthropicMessages(pool *AccountPool) http.HandlerFunc {
 		if len(fileAttachments) > 0 {
 			log.Printf("[upload-debug] extracted %d file attachment(s) from request", len(fileAttachments))
 		}
+		sessionSalt := extractAnthropicSessionSalt(req.Metadata)
+		if sessionSalt != "" {
+			log.Printf("[session] extracted metadata session salt %s", truncateForLog(sessionSalt, 8))
+		}
 
 		// Log converted internal messages
 		logConvertedMessages(messages)
@@ -515,7 +648,7 @@ func HandleAnthropicMessages(pool *AccountPool) http.HandlerFunc {
 		rawMsgCount := 0
 
 		if !isResearcher {
-			fingerprint = computeSessionFingerprint(messages)
+			fingerprint = computeSessionFingerprintWithSalt(messages, sessionSalt)
 			session = globalSessionManager.Get(fingerprint)
 			rawMsgCount = countNonSystemMessages(messages)
 
@@ -570,6 +703,15 @@ func HandleAnthropicMessages(pool *AccountPool) http.HandlerFunc {
 			// Log messages after tool injection only when verbose debugging is enabled.
 			if DebugLoggingEnabled() {
 				log.Printf("[debug] === After tool injection (%d messages) ===", len(messages))
+				for i, m := range messages {
+					preview := truncateForLog(m.Content, 300)
+					log.Printf("[debug]   [%d] role=%s toolcalls=%d content_len=%d: %s", i, m.Role, len(m.ToolCalls), len(m.Content), preview)
+				}
+			}
+		} else if !isResearcher && req.OutputConfig != nil && req.OutputConfig.Format != nil && req.OutputConfig.Format.Type == "json_schema" {
+			messages = applyStructuredOutputBridge(messages, req.OutputConfig)
+			if DebugLoggingEnabled() {
+				log.Printf("[debug] === After structured output bridge (%d messages) ===", len(messages))
 				for i, m := range messages {
 					preview := truncateForLog(m.Content, 300)
 					log.Printf("[debug]   [%d] role=%s toolcalls=%d content_len=%d: %s", i, m.Role, len(m.ToolCalls), len(m.Content), preview)
@@ -1429,36 +1571,11 @@ func handleAnthropicStream(w http.ResponseWriter, acc *Account, messages []ChatM
 		}
 
 		// When any tool action is detected (tool calls, __done__, or WebSearch),
-		// remaining is just the model's "unit test" framing reasoning text.
-		// Convert to thinking block if possible, otherwise suppress entirely.
+		// remaining is usually framing residue or Notion-identity leakage.
+		// Real thinking blocks are already captured separately, so suppress this
+		// text instead of echoing it back to Claude Code.
 		if remaining != "" && (hasCalls || webSearchQuery != "" || doneText != "") {
-			if hasThinking && len(thinkingBlocks) == 0 {
-				// Emit framing text as thinking block (hidden in CC's collapsible fold)
-				sendAnthropicSSE(w, flusher, "content_block_start", map[string]interface{}{
-					"type":          "content_block_start",
-					"index":         blockIndex,
-					"content_block": map[string]interface{}{"type": "thinking", "thinking": ""},
-				})
-				sendAnthropicSSE(w, flusher, "content_block_delta", map[string]interface{}{
-					"type":  "content_block_delta",
-					"index": blockIndex,
-					"delta": map[string]interface{}{"type": "thinking_delta", "thinking": remaining},
-				})
-				sendAnthropicSSE(w, flusher, "content_block_delta", map[string]interface{}{
-					"type":  "content_block_delta",
-					"index": blockIndex,
-					"delta": map[string]interface{}{"type": "signature_delta", "signature": generateFakeSignature()},
-				})
-				sendAnthropicSSE(w, flusher, "content_block_stop", map[string]interface{}{
-					"type": "content_block_stop", "index": blockIndex,
-				})
-				loggedContentBlocks = append(loggedContentBlocks, AnthropicContentBlock{
-					Type:      "thinking",
-					Thinking:  remaining,
-					Signature: generateFakeSignature(),
-				})
-				blockIndex++
-			}
+			log.Printf("[bridge] suppressed %d chars of residual tool framing text", len(remaining))
 			remaining = ""
 		} else if remaining != "" {
 			// No thinking requested or no tool calls — send remaining as plain text
@@ -1763,13 +1880,9 @@ func handleAnthropicNonStream(w http.ResponseWriter, acc *Account, messages []Ch
 			hasCalls = len(toolCalls) > 0
 		}
 
-		// Synthetic thinking fallback (only if no real thinking blocks)
-		if remaining != "" && hasCalls && hasThinking && len(thinkingBlocks) == 0 {
-			contentBlocks = append(contentBlocks, AnthropicContentBlock{
-				Type:      "thinking",
-				Thinking:  remaining,
-				Signature: generateFakeSignature(),
-			})
+		// When tool actions were detected, suppress residual framing / identity text.
+		if remaining != "" && hasCalls {
+			log.Printf("[bridge] suppressed %d chars of residual tool framing text", len(remaining))
 		} else if remaining != "" {
 			contentBlocks = append(contentBlocks, AnthropicContentBlock{Type: "text", Text: remaining})
 		}

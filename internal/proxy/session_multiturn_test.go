@@ -96,6 +96,22 @@ func TestBuildSessionChainFollowUp_TruncatesLargeOutput(t *testing.T) {
 	}
 }
 
+func TestBuildSessionChainFollowUp_ReadOversizeGuard(t *testing.T) {
+	messages := []ChatMessage{
+		{Role: "user", Content: "检查为什么 copy 按钮不显示"},
+		{Role: "assistant", Content: "I'll inspect the file.", ToolCalls: []ToolCall{
+			{ID: "call_1", Type: "function", Function: ToolCallFunction{Name: "Read", Arguments: `{"file_path":"src/content.js"}`}},
+		}},
+		{Role: "tool", ToolCallID: "call_1", Name: "Read", Content: "File content (31582 tokens) exceeds maximum allowed tokens (10000). Use offset and limit parameters to read specific portions of the file."},
+	}
+
+	result := buildSessionChainFollowUp(messages, "- Read(file_path: str, offset?: num, limit?: num)\n- Grep(pattern: str)\n", "")
+	content := result[0].Content
+	if !strings.Contains(content, "Do NOT repeat the same full-file Read") {
+		t.Fatalf("expected oversize read guard in follow-up, got: %s", content)
+	}
+}
+
 // TestCountNonSystemMessages verifies the new helper function.
 func TestCountNonSystemMessages(t *testing.T) {
 	tests := []struct {

@@ -130,15 +130,36 @@ func (sm *SessionManager) cleanupLoop() {
 	}
 }
 
-// computeSessionFingerprint generates a fingerprint from the message history
+func normalizeSessionSystemContent(content string) string {
+	if content == "" {
+		return ""
+	}
+	lines := strings.Split(content, "\n")
+	filtered := make([]string, 0, len(lines))
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "x-anthropic-billing-header:") {
+			continue
+		}
+		filtered = append(filtered, line)
+	}
+	return strings.TrimSpace(strings.Join(filtered, "\n"))
+}
+
+// computeSessionFingerprintWithSalt generates a fingerprint from the message history
 // to identify the same conversation across Anthropic API requests.
-// Strategy: hash(system prompt prefix + first user message prefix)
-func computeSessionFingerprint(messages []ChatMessage) string {
+// Strategy: hash(optional stable salt + normalized system prompt prefix + first user message prefix).
+func computeSessionFingerprintWithSalt(messages []ChatMessage, stableSalt string) string {
 	h := sha256.New()
+	if stableSalt != "" {
+		h.Write([]byte("salt:"))
+		h.Write([]byte(stableSalt))
+		h.Write([]byte{'\n'})
+	}
 	// Include system prompt
 	for _, m := range messages {
 		if m.Role == "system" {
-			content := m.Content
+			content := normalizeSessionSystemContent(m.Content)
 			if len(content) > 200 {
 				content = content[:200]
 			}
@@ -158,6 +179,12 @@ func computeSessionFingerprint(messages []ChatMessage) string {
 		}
 	}
 	return hex.EncodeToString(h.Sum(nil))[:32]
+}
+
+// computeSessionFingerprint keeps the legacy signature for tests/callers that
+// do not have an explicit stable salt available.
+func computeSessionFingerprint(messages []ChatMessage) string {
+	return computeSessionFingerprintWithSalt(messages, "")
 }
 
 // countUserMessages counts the number of user-role messages in the list.
