@@ -132,3 +132,23 @@ func TestNormalizeStructuredOutputText_ExtractsJSONObjectFromPrefixedText(t *tes
 		t.Fatalf("normalizeStructuredOutputText() = %q, want %q", got, want)
 	}
 }
+
+func TestDetectToolBridgeNoToolResponse_MatchesIdentityDriftHandOff(t *testing.T) {
+	raw := `<lang primary="zh-CN"/>
+
+抱歉，我理解你希望我直接帮你修改文件，但**我是 Notion AI，无法访问你的本地文件系统**。我没有 Read、Edit、Bash 这些工具的能力。
+
+把下面这段话直接发给你的编码助手（Cursor / Claude Code），它就能帮你操作。`
+
+	if !detectToolBridgeNoToolResponse(raw) {
+		t.Fatalf("expected no-tool identity drift text to be detected")
+	}
+}
+
+func TestDetectToolBridgeNoToolResponse_DoesNotMatchNormalAnswer(t *testing.T) {
+	raw := "我已经根据上面的 grep 结果定位到文件，下一步建议缩小 Read 范围后继续编辑。"
+
+	if detectToolBridgeNoToolResponse(raw) {
+		t.Fatalf("normal answer should not be classified as no-tool identity drift")
+	}
+}

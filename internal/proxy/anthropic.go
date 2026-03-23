@@ -14,6 +14,8 @@ import (
 	"time"
 )
 
+var ErrToolBridgeNoTool = errors.New("tool bridge produced no usable tool action")
+
 // citationReplacer is a streaming state machine that replaces Notion's
 // [^{{URL}}] and [^URL] citation markers with numbered references [N]
 // as text deltas arrive. It buffers only when inside a potential citation.
@@ -484,6 +486,125 @@ func normalizeStructuredOutputText(content string) string {
 	return trimmed
 }
 
+type preparedToolBridgeResponse struct {
+	ToolCalls      []ToolCall
+	Remaining      string
+	DoneText       string
+	WebSearchQuery string
+	HasCalls       bool
+}
+
+func prepareToolBridgeResponse(content string, nativeToolUses []AgentValueEntry) preparedToolBridgeResponse {
+	prepared := preparedToolBridgeResponse{}
+
+	if len(nativeToolUses) > 0 {
+		prepared.ToolCalls = nativeToolUseToOpenAI(nativeToolUses)
+		prepared.HasCalls = len(prepared.ToolCalls) > 0
+		prepared.Remaining = content
+	}
+	if !prepared.HasCalls {
+		prepared.ToolCalls, prepared.Remaining, prepared.HasCalls = parseToolCalls(content)
+	}
+
+	if prepared.HasCalls {
+		var realCalls []ToolCall
+		for _, tc := range prepared.ToolCalls {
+			if tc.Function.Name == "__done__" {
+				var args map[string]interface{}
+				if err := json.Unmarshal([]byte(tc.Function.Arguments), &args); err == nil {
+					if r, ok := args["result"].(string); ok {
+						prepared.DoneText = r
+					}
+				}
+				if prepared.DoneText == "" {
+					prepared.DoneText = tc.Function.Arguments
+				}
+				log.Printf("[bridge] __done__ intercepted: %s", prepared.DoneText)
+			} else {
+				realCalls = append(realCalls, tc)
+			}
+		}
+		prepared.ToolCalls = realCalls
+		prepared.HasCalls = len(prepared.ToolCalls) > 0
+	}
+
+	if prepared.HasCalls {
+		var keptCalls []ToolCall
+		for _, tc := range prepared.ToolCalls {
+			if tc.Function.Name == "WebSearch" {
+				var args map[string]interface{}
+				var query string
+				if err := json.Unmarshal([]byte(tc.Function.Arguments), &args); err == nil {
+					if q, ok := args["query"].(string); ok {
+						query = q
+					}
+				}
+				if query == "" {
+					query = tc.Function.Arguments
+				}
+				if prepared.WebSearchQuery != "" {
+					prepared.WebSearchQuery = prepared.WebSearchQuery + "\n" + query
+				} else {
+					prepared.WebSearchQuery = query
+				}
+			} else {
+				keptCalls = append(keptCalls, tc)
+			}
+		}
+		prepared.ToolCalls = keptCalls
+		prepared.HasCalls = len(prepared.ToolCalls) > 0
+	}
+
+	return prepared
+}
+
+func normalizeToolBridgeResidualText(text string) string {
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" {
+		return ""
+	}
+	trimmed = strings.TrimSpace(structuredOutputLeadingTagRegex.ReplaceAllString(trimmed, ""))
+	return trimmed
+}
+
+func detectToolBridgeNoToolResponse(text string) bool {
+	normalized := normalizeToolBridgeResidualText(text)
+	if normalized == "" {
+		return false
+	}
+
+	lower := strings.ToLower(normalized)
+	mentionsNotionIdentity := strings.Contains(normalized, "我是 Notion AI") ||
+		strings.Contains(lower, "i am notion ai")
+	mentionsLocalFS := strings.Contains(normalized, "本地文件系统") ||
+		strings.Contains(lower, "local file system")
+	mentionsCodingAssistant := strings.Contains(normalized, "编码助手") ||
+		strings.Contains(normalized, "Claude Code") ||
+		strings.Contains(normalized, "Cursor") ||
+		strings.Contains(lower, "coding assistant")
+	mentionsManualHandOff := strings.Contains(normalized, "复制粘贴") ||
+		strings.Contains(normalized, "手动添加") ||
+		strings.Contains(normalized, "你可以这样做") ||
+		strings.Contains(lower, "copy and paste") ||
+		strings.Contains(lower, "manually add")
+	mentionsMissingLocalTools := strings.Contains(lower, "read") &&
+		strings.Contains(lower, "edit") &&
+		strings.Contains(lower, "bash")
+
+	switch {
+	case mentionsNotionIdentity && mentionsLocalFS:
+		return true
+	case mentionsLocalFS && mentionsCodingAssistant:
+		return true
+	case mentionsNotionIdentity && mentionsCodingAssistant:
+		return true
+	case mentionsMissingLocalTools && mentionsCodingAssistant && mentionsManualHandOff:
+		return true
+	default:
+		return false
+	}
+}
+
 func extractAnthropicSessionSalt(metadata map[string]interface{}) string {
 	if len(metadata) == 0 {
 		return ""
@@ -780,6 +901,8 @@ func HandleAnthropicMessages(pool *AccountPool) http.HandlerFunc {
 		var lastNonQuotaErr error
 		var sawEmptyResponse bool
 		var recoveryMessages []ChatMessage
+		var toolRecoveryMessages []ChatMessage
+		toolBridgeRetried := false
 
 		for attempt := 0; attempt < maxAttempts; attempt++ {
 			var acc *Account
@@ -813,15 +936,20 @@ func HandleAnthropicMessages(pool *AccountPool) http.HandlerFunc {
 			tried[acc] = true
 
 			requestMessages := messages
-			if !isResearcher && isFirstTurn && needsFreshThreadRecovery(messages) {
-				if recoveryMessages == nil {
-					recoveryMessages = buildFreshThreadRecoveryMessages(messages)
-					if len(recoveryMessages) == 1 {
-						log.Printf("[session] collapsed history to self-contained fresh-thread prompt (%d→%d chars)",
-							len(messages), len(recoveryMessages[0].Content))
+			if !isResearcher && isFirstTurn {
+				switch {
+				case len(toolRecoveryMessages) > 0:
+					requestMessages = toolRecoveryMessages
+				case needsFreshThreadRecovery(messages):
+					if recoveryMessages == nil {
+						recoveryMessages = buildFreshThreadRecoveryMessages(messages)
+						if len(recoveryMessages) == 1 {
+							log.Printf("[session] collapsed history to self-contained fresh-thread prompt (%d→%d chars)",
+								len(messages), len(recoveryMessages[0].Content))
+						}
 					}
+					requestMessages = recoveryMessages
 				}
-				requestMessages = recoveryMessages
 			}
 
 			// For first turn, pre-create session with generated IDs
@@ -922,6 +1050,25 @@ func HandleAnthropicMessages(pool *AccountPool) http.HandlerFunc {
 					isRepeatTurn = false
 				}
 				continue
+			}
+
+			if reqErr != nil && errors.Is(reqErr, ErrToolBridgeNoTool) {
+				if !toolBridgeRetried {
+					log.Printf("[bridge] %s returned no-tool identity-drift text, clearing session and retrying once with sanitized recovery prompt", acc.UserEmail)
+					toolBridgeRetried = true
+					if fingerprint != "" {
+						globalSessionManager.Delete(fingerprint)
+					}
+					session = nil
+					isFirstTurn = true
+					isRepeatTurn = false
+					toolRecoveryMessages = buildToolBridgeRecoveryMessages(messages)
+					recoveryMessages = nil
+					tried = make(map[*Account]bool)
+					attempt = -1
+					continue
+				}
+				lastNonQuotaErr = reqErr
 			}
 
 			if reqErr != nil {
@@ -1504,6 +1651,16 @@ func handleAnthropicStream(w http.ResponseWriter, acc *Account, messages []ChatM
 		return ErrEmptyResponse
 	}
 
+	var prepared preparedToolBridgeResponse
+	if hasTools {
+		prepared = prepareToolBridgeResponse(contentStr, nativeToolUses)
+		actionDetected := prepared.HasCalls || prepared.WebSearchQuery != "" || prepared.DoneText != ""
+		if !actionDetected && detectToolBridgeNoToolResponse(prepared.Remaining) {
+			log.Printf("[bridge] %s detected no-tool identity-drift text (%d chars), requesting clean retry", requestID, len(prepared.Remaining))
+			return ErrToolBridgeNoTool
+		}
+	}
+
 	// Build usage
 	aUsage := &AnthropicUsage{}
 	if finalUsage != nil {
@@ -1579,73 +1736,11 @@ func handleAnthropicStream(w http.ResponseWriter, acc *Account, messages []ChatM
 	}
 
 	if hasTools {
-		content := fullContent.String()
-		var toolCalls []ToolCall
-		var remaining string
-		var hasCalls bool
-
-		if len(nativeToolUses) > 0 {
-			toolCalls = nativeToolUseToOpenAI(nativeToolUses)
-			hasCalls = len(toolCalls) > 0
-			remaining = content
-		}
-		if !hasCalls {
-			toolCalls, remaining, hasCalls = parseToolCalls(content)
-		}
-
-		// Intercept __done__ pseudo-function: convert to text response
-		var doneText string
-		if hasCalls {
-			var realCalls []ToolCall
-			for _, tc := range toolCalls {
-				if tc.Function.Name == "__done__" {
-					// Extract "result" from arguments
-					var args map[string]interface{}
-					if err := json.Unmarshal([]byte(tc.Function.Arguments), &args); err == nil {
-						if r, ok := args["result"].(string); ok {
-							doneText = r
-						}
-					}
-					if doneText == "" {
-						doneText = tc.Function.Arguments // fallback: raw args as text
-					}
-					log.Printf("[bridge] __done__ intercepted: %s", doneText)
-				} else {
-					realCalls = append(realCalls, tc)
-				}
-			}
-			toolCalls = realCalls
-			hasCalls = len(toolCalls) > 0
-		}
-
-		// Intercept WebSearch tool calls → collect queries for streaming execution
-		var webSearchQuery string
-		if hasCalls {
-			var keptCalls []ToolCall
-			for _, tc := range toolCalls {
-				if tc.Function.Name == "WebSearch" {
-					var args map[string]interface{}
-					var q string
-					if err := json.Unmarshal([]byte(tc.Function.Arguments), &args); err == nil {
-						if qv, ok := args["query"].(string); ok {
-							q = qv
-						}
-					}
-					if q == "" {
-						q = tc.Function.Arguments
-					}
-					if webSearchQuery != "" {
-						webSearchQuery = webSearchQuery + "\n" + q
-					} else {
-						webSearchQuery = q
-					}
-				} else {
-					keptCalls = append(keptCalls, tc)
-				}
-			}
-			toolCalls = keptCalls
-			hasCalls = len(toolCalls) > 0
-		}
+		toolCalls := prepared.ToolCalls
+		remaining := prepared.Remaining
+		hasCalls := prepared.HasCalls
+		doneText := prepared.DoneText
+		webSearchQuery := prepared.WebSearchQuery
 
 		// When any tool action is detected (tool calls, __done__, or WebSearch),
 		// remaining is usually framing residue or Notion-identity leakage.
@@ -1841,6 +1936,16 @@ func handleAnthropicNonStream(w http.ResponseWriter, acc *Account, messages []Ch
 		return ErrEmptyResponse
 	}
 
+	var prepared preparedToolBridgeResponse
+	if hasTools {
+		prepared = prepareToolBridgeResponse(content, nativeToolUses)
+		actionDetected := prepared.HasCalls || prepared.WebSearchQuery != "" || prepared.DoneText != ""
+		if !actionDetected && detectToolBridgeNoToolResponse(prepared.Remaining) {
+			log.Printf("[bridge] %s detected no-tool identity-drift text (%d chars), requesting clean retry", requestID, len(prepared.Remaining))
+			return ErrToolBridgeNoTool
+		}
+	}
+
 	aUsage := &AnthropicUsage{}
 	if finalUsage != nil {
 		aUsage.InputTokens = finalUsage.PromptTokens
@@ -1876,82 +1981,40 @@ func handleAnthropicNonStream(w http.ResponseWriter, acc *Account, messages []Ch
 	}
 
 	if hasTools {
-		var toolCalls []ToolCall
-		var remaining string
-		var hasCalls bool
-
-		if len(nativeToolUses) > 0 {
-			toolCalls = nativeToolUseToOpenAI(nativeToolUses)
-			hasCalls = len(toolCalls) > 0
-			remaining = content
-		}
-		if !hasCalls {
-			toolCalls, remaining, hasCalls = parseToolCalls(content)
-		}
-
-		// Intercept __done__ pseudo-function: convert to text response
-		var doneText string
-		if hasCalls {
-			var realCalls []ToolCall
-			for _, tc := range toolCalls {
-				if tc.Function.Name == "__done__" {
-					var args map[string]interface{}
-					if err := json.Unmarshal([]byte(tc.Function.Arguments), &args); err == nil {
-						if r, ok := args["result"].(string); ok {
-							doneText = r
-						}
-					}
-					if doneText == "" {
-						doneText = tc.Function.Arguments
-					}
-					log.Printf("[bridge] __done__ intercepted: %s", doneText)
-				} else {
-					realCalls = append(realCalls, tc)
-				}
-			}
-			toolCalls = realCalls
-			hasCalls = len(toolCalls) > 0
-		}
+		toolCalls := prepared.ToolCalls
+		remaining := prepared.Remaining
+		hasCalls := prepared.HasCalls
+		doneText := prepared.DoneText
 
 		// Intercept WebSearch tool calls → execute via Notion's native search
+		if prepared.WebSearchQuery != "" {
+			log.Printf("[bridge] WebSearch intercepted — executing via Notion native search: %q", prepared.WebSearchQuery)
+			searchResult, searchUsage, searchErr := executeWebSearch(acc, prepared.WebSearchQuery, model, requestID)
+			if searchErr == nil && searchResult != "" {
+				if doneText != "" {
+					doneText = doneText + "\n\n" + searchResult
+				} else {
+					doneText = searchResult
+				}
+				if searchUsage != nil && finalUsage != nil {
+					finalUsage.PromptTokens += searchUsage.PromptTokens
+					finalUsage.CompletionTokens += searchUsage.CompletionTokens
+					finalUsage.TotalTokens = finalUsage.PromptTokens + finalUsage.CompletionTokens
+				}
+			} else if searchErr != nil {
+				log.Printf("[bridge] WebSearch execution failed: %v", searchErr)
+				if doneText != "" {
+					doneText = doneText + "\n\nWeb search failed: " + searchErr.Error()
+				} else {
+					doneText = "Web search failed: " + searchErr.Error()
+				}
+			}
+		}
+
 		if hasCalls {
 			var keptCalls []ToolCall
 			for _, tc := range toolCalls {
-				if tc.Function.Name == "WebSearch" {
-					var args map[string]interface{}
-					var query string
-					if err := json.Unmarshal([]byte(tc.Function.Arguments), &args); err == nil {
-						if q, ok := args["query"].(string); ok {
-							query = q
-						}
-					}
-					if query == "" {
-						query = tc.Function.Arguments
-					}
-					log.Printf("[bridge] WebSearch intercepted — executing via Notion native search: %q", query)
-					searchResult, searchUsage, searchErr := executeWebSearch(acc, query, model, requestID)
-					if searchErr == nil && searchResult != "" {
-						if doneText != "" {
-							doneText = doneText + "\n\n" + searchResult
-						} else {
-							doneText = searchResult
-						}
-						if searchUsage != nil && finalUsage != nil {
-							finalUsage.PromptTokens += searchUsage.PromptTokens
-							finalUsage.CompletionTokens += searchUsage.CompletionTokens
-							finalUsage.TotalTokens = finalUsage.PromptTokens + finalUsage.CompletionTokens
-						}
-					} else if searchErr != nil {
-						log.Printf("[bridge] WebSearch execution failed: %v", searchErr)
-						if doneText != "" {
-							doneText = doneText + "\n\nWeb search failed: " + searchErr.Error()
-						} else {
-							doneText = "Web search failed: " + searchErr.Error()
-						}
-					}
-				} else {
-					keptCalls = append(keptCalls, tc)
-				}
+				keptCalls = append(keptCalls, tc)
 			}
 			toolCalls = keptCalls
 			hasCalls = len(toolCalls) > 0
