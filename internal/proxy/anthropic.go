@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -429,6 +430,60 @@ type AnthropicUsage struct {
 	OutputTokens int `json:"output_tokens"`
 }
 
+var structuredOutputLeadingTagRegex = regexp.MustCompile(`(?s)^\s*(?:<[A-Za-z][^>\n]*/>\s*)+`)
+
+func isJSONSchemaOutput(outputConfig *AnthropicOutputConfig) bool {
+	return outputConfig != nil && outputConfig.Format != nil && outputConfig.Format.Type == "json_schema" && outputConfig.Format.Schema != nil
+}
+
+func extractStructuredJSONObject(content string) string {
+	trimmed := strings.TrimSpace(content)
+	if trimmed == "" {
+		return ""
+	}
+	trimmed = strings.TrimSpace(structuredOutputLeadingTagRegex.ReplaceAllString(trimmed, ""))
+	if trimmed == "" {
+		return ""
+	}
+	if strings.HasPrefix(trimmed, "{") && json.Valid([]byte(trimmed)) {
+		return trimmed
+	}
+	for _, match := range mdFenceRegex.FindAllStringSubmatch(trimmed, -1) {
+		candidate := strings.TrimSpace(match[1])
+		candidate = strings.TrimSpace(structuredOutputLeadingTagRegex.ReplaceAllString(candidate, ""))
+		if strings.HasPrefix(candidate, "{") && json.Valid([]byte(candidate)) {
+			return candidate
+		}
+	}
+	for i, r := range trimmed {
+		if r != '{' {
+			continue
+		}
+		decoder := json.NewDecoder(strings.NewReader(trimmed[i:]))
+		var raw json.RawMessage
+		if err := decoder.Decode(&raw); err != nil || len(raw) == 0 || raw[0] != '{' || !json.Valid(raw) {
+			continue
+		}
+		rest := strings.TrimSpace(trimmed[i+int(decoder.InputOffset()):])
+		rest = strings.TrimSpace(structuredOutputLeadingTagRegex.ReplaceAllString(rest, ""))
+		if rest == "" {
+			return string(raw)
+		}
+	}
+	return ""
+}
+
+func normalizeStructuredOutputText(content string) string {
+	if extracted := extractStructuredJSONObject(content); extracted != "" {
+		return extracted
+	}
+	trimmed := strings.TrimSpace(content)
+	if trimmed != "" {
+		log.Printf("[bridge] structured output JSON-only normalization fallback (%d chars)", len(trimmed))
+	}
+	return trimmed
+}
+
 func extractAnthropicSessionSalt(metadata map[string]interface{}) string {
 	if len(metadata) == 0 {
 		return ""
@@ -822,9 +877,9 @@ func HandleAnthropicMessages(pool *AccountPool) http.HandlerFunc {
 					reqErr = handleResearcherNonStream(w, acc, requestMessages, model, requestID, hasThinking)
 				}
 			} else if req.Stream {
-				reqErr = handleAnthropicStream(w, acc, requestMessages, model, requestID, hasTools, hasThinking, enableWebSearch, enableWorkspaceSearch, uploadedAttachments, currentSession)
+				reqErr = handleAnthropicStream(w, acc, requestMessages, model, requestID, hasTools, hasThinking, enableWebSearch, enableWorkspaceSearch, uploadedAttachments, req.OutputConfig, currentSession)
 			} else {
-				reqErr = handleAnthropicNonStream(w, acc, requestMessages, model, requestID, hasTools, hasThinking, enableWebSearch, enableWorkspaceSearch, uploadedAttachments, currentSession)
+				reqErr = handleAnthropicNonStream(w, acc, requestMessages, model, requestID, hasTools, hasThinking, enableWebSearch, enableWorkspaceSearch, uploadedAttachments, req.OutputConfig, currentSession)
 			}
 
 			if reqErr != nil && errors.Is(reqErr, ErrResearchQuotaExhausted) {
@@ -1132,7 +1187,7 @@ func extractFileFromSource(source map[string]interface{}, blockKind string) *Fil
 	}
 }
 
-func streamAnthropicTextResponse(w http.ResponseWriter, acc *Account, messages []ChatMessage, model, requestID string, hasThinking bool, disableBuiltin bool, callOpts CallOptions) error {
+func streamAnthropicTextResponse(w http.ResponseWriter, acc *Account, messages []ChatMessage, model, requestID string, hasThinking bool, disableBuiltin bool, outputConfig *AnthropicOutputConfig, callOpts CallOptions) error {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		writeAnthropicError(w, requestID, http.StatusInternalServerError, "streaming not supported", "api_error")
@@ -1154,6 +1209,7 @@ func streamAnthropicTextResponse(w http.ResponseWriter, acc *Account, messages [
 	callOpts.KnownCitationURLs = &knownCitationURLs
 	callOpts.KnownCitationDocs = &knownCitationDocs
 	callOpts.KnownToolCallURLs = &knownToolCallURLs
+	jsonOnlyOutput := isJSONSchemaOutput(outputConfig)
 
 	ensureHeaders := func() {
 		if headersSent {
@@ -1248,15 +1304,17 @@ func streamAnthropicTextResponse(w http.ResponseWriter, acc *Account, messages [
 	cbErr := CallInference(acc, messages, model, disableBuiltin, func(delta string, done bool, usage *UsageInfo) {
 		if delta != "" {
 			fullContent.WriteString(delta)
-			cleaned := cr.Process(delta)
-			if cleaned != "" {
-				sawContent = true
-				ensureTextBlock()
-				sendAnthropicSSE(w, flusher, "content_block_delta", map[string]interface{}{
-					"type":  "content_block_delta",
-					"index": blockIndex,
-					"delta": map[string]interface{}{"type": "text_delta", "text": cleaned},
-				})
+			if !jsonOnlyOutput {
+				cleaned := cr.Process(delta)
+				if cleaned != "" {
+					sawContent = true
+					ensureTextBlock()
+					sendAnthropicSSE(w, flusher, "content_block_delta", map[string]interface{}{
+						"type":  "content_block_delta",
+						"index": blockIndex,
+						"delta": map[string]interface{}{"type": "text_delta", "text": cleaned},
+					})
+				}
 			}
 		}
 		if usage != nil {
@@ -1285,14 +1343,27 @@ func streamAnthropicTextResponse(w http.ResponseWriter, acc *Account, messages [
 		closeThinkingBlock("")
 	}
 
-	if flushed := cr.Flush(); flushed != "" {
-		sawContent = true
-		ensureTextBlock()
-		sendAnthropicSSE(w, flusher, "content_block_delta", map[string]interface{}{
-			"type":  "content_block_delta",
-			"index": blockIndex,
-			"delta": map[string]interface{}{"type": "text_delta", "text": flushed},
-		})
+	if !jsonOnlyOutput {
+		if flushed := cr.Flush(); flushed != "" {
+			sawContent = true
+			ensureTextBlock()
+			sendAnthropicSSE(w, flusher, "content_block_delta", map[string]interface{}{
+				"type":  "content_block_delta",
+				"index": blockIndex,
+				"delta": map[string]interface{}{"type": "text_delta", "text": flushed},
+			})
+		}
+	} else {
+		normalized := normalizeStructuredOutputText(fullContent.String())
+		if normalized != "" {
+			sawContent = true
+			ensureTextBlock()
+			sendAnthropicSSE(w, flusher, "content_block_delta", map[string]interface{}{
+				"type":  "content_block_delta",
+				"index": blockIndex,
+				"delta": map[string]interface{}{"type": "text_delta", "text": normalized},
+			})
+		}
 	}
 
 	if textBlockOpen {
@@ -1303,22 +1374,24 @@ func streamAnthropicTextResponse(w http.ResponseWriter, acc *Account, messages [
 	}
 
 	urls := cr.URLs()
-	if sourcesText := formatCitationSources(urls); sourcesText != "" {
-		ensureHeaders()
-		sendAnthropicSSE(w, flusher, "content_block_start", map[string]interface{}{
-			"type":          "content_block_start",
-			"index":         blockIndex,
-			"content_block": map[string]interface{}{"type": "text", "text": ""},
-		})
-		sendAnthropicSSE(w, flusher, "content_block_delta", map[string]interface{}{
-			"type":  "content_block_delta",
-			"index": blockIndex,
-			"delta": map[string]interface{}{"type": "text_delta", "text": sourcesText},
-		})
-		sendAnthropicSSE(w, flusher, "content_block_stop", map[string]interface{}{
-			"type": "content_block_stop", "index": blockIndex,
-		})
-		blockIndex++
+	if !jsonOnlyOutput {
+		if sourcesText := formatCitationSources(urls); sourcesText != "" {
+			ensureHeaders()
+			sendAnthropicSSE(w, flusher, "content_block_start", map[string]interface{}{
+				"type":          "content_block_start",
+				"index":         blockIndex,
+				"content_block": map[string]interface{}{"type": "text", "text": ""},
+			})
+			sendAnthropicSSE(w, flusher, "content_block_delta", map[string]interface{}{
+				"type":  "content_block_delta",
+				"index": blockIndex,
+				"delta": map[string]interface{}{"type": "text_delta", "text": sourcesText},
+			})
+			sendAnthropicSSE(w, flusher, "content_block_stop", map[string]interface{}{
+				"type": "content_block_stop", "index": blockIndex,
+			})
+			blockIndex++
+		}
 	}
 
 	outputTokens := 0
@@ -1344,9 +1417,13 @@ func streamAnthropicTextResponse(w http.ResponseWriter, acc *Account, messages [
 		})
 	}
 	if fullContent.Len() > 0 {
+		text := renderAnthropicCitationText(fullContent.String(), knownCitationURLs, knownCitationDocs, knownToolCallURLs)
+		if jsonOnlyOutput {
+			text = normalizeStructuredOutputText(fullContent.String())
+		}
 		contentBlocks = append(contentBlocks, AnthropicContentBlock{
 			Type: "text",
-			Text: renderAnthropicCitationText(fullContent.String(), knownCitationURLs, knownCitationDocs, knownToolCallURLs),
+			Text: text,
 		})
 	}
 	LogAPIOutputJSON(requestID, "anthropic stream summary", AnthropicResponse{
@@ -1367,7 +1444,7 @@ func streamAnthropicTextResponse(w http.ResponseWriter, acc *Account, messages [
 }
 
 // handleAnthropicStream handles streaming Anthropic response
-func handleAnthropicStream(w http.ResponseWriter, acc *Account, messages []ChatMessage, model, requestID string, hasTools bool, hasThinking bool, enableWebSearch bool, enableWorkspaceSearch *bool, attachments []UploadedAttachment, session *Session) error {
+func handleAnthropicStream(w http.ResponseWriter, acc *Account, messages []ChatMessage, model, requestID string, hasTools bool, hasThinking bool, enableWebSearch bool, enableWorkspaceSearch *bool, attachments []UploadedAttachment, outputConfig *AnthropicOutputConfig, session *Session) error {
 	var fullContent strings.Builder
 	var finalUsage *UsageInfo
 	var nativeToolUses []AgentValueEntry
@@ -1391,7 +1468,7 @@ func handleAnthropicStream(w http.ResponseWriter, acc *Account, messages []ChatM
 	}
 
 	if !hasTools {
-		return streamAnthropicTextResponse(w, acc, messages, model, requestID, hasThinking, disableBuiltin, callOpts)
+		return streamAnthropicTextResponse(w, acc, messages, model, requestID, hasThinking, disableBuiltin, outputConfig, callOpts)
 	}
 
 	callOpts.NativeToolUses = &nativeToolUses
@@ -1691,7 +1768,7 @@ func handleAnthropicStream(w http.ResponseWriter, acc *Account, messages []ChatM
 }
 
 // handleAnthropicNonStream handles non-streaming Anthropic response
-func handleAnthropicNonStream(w http.ResponseWriter, acc *Account, messages []ChatMessage, model, requestID string, hasTools bool, hasThinking bool, enableWebSearch bool, enableWorkspaceSearch *bool, attachments []UploadedAttachment, session *Session) error {
+func handleAnthropicNonStream(w http.ResponseWriter, acc *Account, messages []ChatMessage, model, requestID string, hasTools bool, hasThinking bool, enableWebSearch bool, enableWorkspaceSearch *bool, attachments []UploadedAttachment, outputConfig *AnthropicOutputConfig, session *Session) error {
 	var fullContent strings.Builder
 	var finalUsage *UsageInfo
 	var nativeToolUses []AgentValueEntry
@@ -1901,6 +1978,9 @@ func handleAnthropicNonStream(w http.ResponseWriter, acc *Account, messages []Ch
 			}
 		}
 	} else {
+		if isJSONSchemaOutput(outputConfig) {
+			content = normalizeStructuredOutputText(content)
+		}
 		contentBlocks = append(contentBlocks, AnthropicContentBlock{
 			Type: "text",
 			Text: cleanCitationsWithContext(content, knownToolCallURLs, knownCitationURLs, knownCitationDocs),

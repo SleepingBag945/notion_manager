@@ -114,3 +114,21 @@ func TestInjectToolsIntoMessages_DropsWrapperOnlyUserMessage(t *testing.T) {
 		t.Fatalf("expected actual user query in bridged content, got %q", content)
 	}
 }
+
+func TestNormalizeStructuredOutputText_StripsLangTagAndMarkdownFence(t *testing.T) {
+	raw := "<lang primary=\"zh-CN\"/>\n\n```json\n{\"title\":\"Fix digest error\"}\n```"
+	got := normalizeStructuredOutputText(raw)
+	want := "{\"title\":\"Fix digest error\"}"
+	if got != want {
+		t.Fatalf("normalizeStructuredOutputText() = %q, want %q", got, want)
+	}
+}
+
+func TestNormalizeStructuredOutputText_ExtractsJSONObjectFromPrefixedText(t *testing.T) {
+	raw := "Here is the JSON output you requested:\n{\"title\":\"Fix invalid password\"}"
+	got := normalizeStructuredOutputText(raw)
+	want := "{\"title\":\"Fix invalid password\"}"
+	if got != want {
+		t.Fatalf("normalizeStructuredOutputText() = %q, want %q", got, want)
+	}
+}
