@@ -150,7 +150,30 @@ func normalizeSessionUserContent(content string) string {
 	if content == "" {
 		return ""
 	}
+	if isProxySyntheticUserPrompt(content) {
+		return strings.TrimSpace(stripSystemReminderBlocks(content))
+	}
 	return strings.TrimSpace(stripSystemReminders(content))
+}
+
+func isProxySyntheticUserPrompt(content string) bool {
+	trimmed := strings.TrimSpace(content)
+	if trimmed == "" {
+		return false
+	}
+	if strings.HasPrefix(trimmed, "Continue this conversation on a fresh thread.") {
+		return true
+	}
+	if strings.Contains(trimmed, "Output format: {\"name\": \"function_name\", \"arguments\": {...}}") {
+		if strings.HasPrefix(trimmed, "Results from executed function(s):") ||
+			strings.HasPrefix(trimmed, "I'm writing a unit test") {
+			return true
+		}
+	}
+	if strings.Contains(trimmed, "Edit recovery hint:") || strings.Contains(trimmed, "Path recovery hint:") {
+		return true
+	}
+	return false
 }
 
 func isMeaningfulUserMessage(msg ChatMessage) bool {

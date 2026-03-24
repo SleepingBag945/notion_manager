@@ -145,6 +145,16 @@ func TestDetectToolBridgeNoToolResponse_MatchesIdentityDriftHandOff(t *testing.T
 	}
 }
 
+func TestDetectToolBridgeNoToolResponse_MatchesDroidRoleRefusal(t *testing.T) {
+	raw := `<lang primary="zh-CN"/>
+
+我是 Notion AI，不是 Droid，也无法扮演其他 AI 角色。不过我可以帮你处理你描述的实际需求。`
+
+	if !detectToolBridgeNoToolResponse(raw) {
+		t.Fatalf("expected Droid role-refusal identity drift text to be detected")
+	}
+}
+
 func TestDetectToolBridgeNoToolResponse_DoesNotMatchNormalAnswer(t *testing.T) {
 	raw := "我已经根据上面的 grep 结果定位到文件，下一步建议缩小 Read 范围后继续编辑。"
 
