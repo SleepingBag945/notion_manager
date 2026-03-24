@@ -34,7 +34,7 @@
 
 - **Dashboard** at `/dashboard/` — manage accounts, view quota, toggle settings
 - **Reverse Proxy** at `/ai` — full Notion AI web UI with pooled accounts
-- **Anthropic Messages API** at `POST /v1/messages` — compatible with Claude Code, Cherry Studio, etc.
+- **API gateway** at `POST /v1/messages`, `POST /v1/chat/completions`, and `POST /v1/responses` — compatible with Anthropic and OpenAI-style clients
 
 ## Quick Start
 
@@ -66,6 +66,9 @@ The account is auto-discovered and hot-loaded — no restart needed.
 export ANTHROPIC_BASE_URL=http://localhost:8081
 export ANTHROPIC_API_KEY=<your-api-key>
 claude  # or any Anthropic-compatible client
+
+export OPENAI_BASE_URL=http://localhost:8081/v1
+export OPENAI_API_KEY=<your-api-key>
 ```
 
 Or download a pre-built binary from [Releases](https://github.com/SleepingBag945/notion-manager/releases) — no Go toolchain required.
@@ -100,14 +103,17 @@ Or download a pre-built binary from [Releases](https://github.com/SleepingBag945
 - Proxy HTML, `/api/*`, static assets, `msgstore`, and WebSocket traffic
 - Rewrite Notion frontend base URLs and strip analytics scripts
 
-### Anthropic-compatible API
+### API compatibility
 
-- `POST /v1/messages`
+- `POST /v1/messages` — Anthropic Messages API
+- `POST /v1/chat/completions` — OpenAI Chat Completions API
+- `POST /v1/responses` — OpenAI Responses API
 - Supports both `Authorization: Bearer <api_key>` and `x-api-key: <api_key>`
 - Streaming and non-streaming responses
-- Anthropic `tools`
-- File content blocks for images, PDFs, and CSVs
+- Anthropic `tools` and OpenAI `tools` / `function_call`
+- File inputs for images, PDFs, and CSVs reuse the existing Notion upload pipeline
 - Default model fallback via `proxy.default_model`
+- `previous_response_id` is intentionally unsupported in `/v1/responses` (stateless bridge)
 
 <p align="center">
   <img src="img/cherry.jpg" alt="Cherry Studio" width="480"><br>

@@ -41,6 +41,8 @@ export ENABLE_WORKSPACE_SEARCH=false
 | --- | --- | --- |
 | `GET /health` | 健康检查与账号池摘要 | 无 |
 | `POST /v1/messages` | Anthropic Messages API | API Key |
+| `POST /v1/chat/completions` | OpenAI Chat Completions API | API Key |
+| `POST /v1/responses` | OpenAI Responses API | API Key |
 | `GET /dashboard/` | 管理面板 | Dashboard 登录 |
 | `GET /proxy/start` | 为选定账号创建代理会话 | Dashboard 登录 |
 | `GET /ai` | Notion Web 代理入口 | `np_session` |

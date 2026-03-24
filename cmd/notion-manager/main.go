@@ -128,8 +128,10 @@ func main() {
 
 	mux := http.NewServeMux()
 
-	// Anthropic Messages API endpoint (only supported format)
+	// Anthropic + OpenAI-compatible API endpoints
 	mux.HandleFunc("/v1/messages", proxy.HandleAnthropicMessages(pool))
+	mux.HandleFunc("/v1/chat/completions", proxy.HandleOpenAIChatCompletions(pool))
+	mux.HandleFunc("/v1/responses", proxy.HandleOpenAIResponses(pool))
 
 	// Health check with quota details
 	mux.HandleFunc("/health", proxy.HandleHealth(pool))
@@ -169,7 +171,9 @@ func main() {
 	log.Printf("Endpoints:")
 	log.Printf("  GET  /dashboard/    (Dashboard UI)")
 	log.Printf("  GET  /proxy/start   (Open proxy for account)")
-	log.Printf("  POST /v1/messages   (Anthropic API)")
+	log.Printf("  POST /v1/messages            (Anthropic Messages API)")
+	log.Printf("  POST /v1/chat/completions    (OpenAI Chat Completions API)")
+	log.Printf("  POST /v1/responses           (OpenAI Responses API)")
 	log.Printf("  GET  /health")
 	log.Printf("  GET  /admin/accounts")
 	log.Printf("  GET  /admin/models")

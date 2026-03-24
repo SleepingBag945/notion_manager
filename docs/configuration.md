@@ -32,6 +32,8 @@ environment variables > config.yaml > code defaults
 | --- | --- | --- |
 | `GET /health` | Health and account pool summary | None |
 | `POST /v1/messages` | Anthropic Messages API | API key |
+| `POST /v1/chat/completions` | OpenAI Chat Completions API | API key |
+| `POST /v1/responses` | OpenAI Responses API | API key |
 | `GET /dashboard/` | Dashboard UI | Dashboard login |
 | `GET /proxy/start` | Create a targeted proxy session | Dashboard login |
 | `GET /ai` | Local Notion Web proxy entry | `np_session` |

@@ -2,7 +2,17 @@
 
 [← Back to README](../README.md)
 
-## Standard request
+## Supported API shapes
+
+- `POST /v1/messages` — Anthropic Messages API
+- `POST /v1/chat/completions` — OpenAI Chat Completions API
+- `POST /v1/responses` — OpenAI Responses API
+
+All three routes reuse the same multi-account pool, file upload pipeline, tool bridge, and failover logic.
+
+`/v1/responses` is currently stateless, so `previous_response_id` is not supported.
+
+## Anthropic Messages request
 
 `/v1/messages` accepts Anthropic Messages API payloads.
 
@@ -20,6 +30,36 @@ curl http://localhost:3000/v1/messages \
 ```
 
 If `model` is omitted, the service falls back to `proxy.default_model`.
+
+## OpenAI Chat Completions request
+
+```bash
+curl http://localhost:3000/v1/chat/completions \
+  -H "Authorization: Bearer <api_key>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gpt-5.4",
+    "messages": [
+      { "role": "user", "content": "Summarize the architecture of notion-manager." }
+    ]
+  }'
+```
+
+Supported request features include `messages`, `stream`, `tools`, `tool_choice`, `response_format`, and inline file/image inputs.
+
+## OpenAI Responses request
+
+```bash
+curl http://localhost:3000/v1/responses \
+  -H "Authorization: Bearer <api_key>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gpt-5.4",
+    "input": "List the main subsystems in this project."
+  }'
+```
+
+Supported request features include `input`, `instructions`, `stream`, `tools`, `tool_choice`, `text.format`, and inline file/image inputs.
 
 ## Search overrides
 

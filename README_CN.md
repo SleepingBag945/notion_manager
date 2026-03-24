@@ -34,7 +34,7 @@
 
 - **Dashboard** `/dashboard/` — 管理账号、查看额度、切换设置
 - **Reverse Proxy** `/ai` — 本地使用完整 Notion AI 页面
-- **Anthropic Messages API** `POST /v1/messages` — 兼容 Claude Code、Cherry Studio 等
+- **API 网关** `POST /v1/messages`、`POST /v1/chat/completions`、`POST /v1/responses` — 同时兼容 Anthropic 与 OpenAI 风格客户端
 
 ## 快速开始
 
@@ -66,6 +66,9 @@ http://localhost:8081/dashboard/
 export ANTHROPIC_BASE_URL=http://localhost:8081
 export ANTHROPIC_API_KEY=<your-api-key>
 claude  # 或任何 Anthropic 兼容客户端
+
+export OPENAI_BASE_URL=http://localhost:8081/v1
+export OPENAI_API_KEY=<your-api-key>
 ```
 
 也可以从 [Releases](https://github.com/SleepingBag945/notion-manager/releases) 下载预编译二进制，无需 Go 工具链。
@@ -100,14 +103,17 @@ claude  # 或任何 Anthropic 兼容客户端
 - 转发 Notion HTML、`/api/*`、静态资源、`msgstore` 和 WebSocket
 - 会动态改写 `CONFIG.domainBaseUrl`，并过滤分析脚本
 
-### 4. Anthropic 协议兼容 API
+### 4. API 协议兼容层
 
-- 提供 `POST /v1/messages`
+- `POST /v1/messages` — Anthropic Messages API
+- `POST /v1/chat/completions` — OpenAI Chat Completions API
+- `POST /v1/responses` — OpenAI Responses API
 - 同时支持 `Authorization: Bearer <api_key>` 和 `x-api-key: <api_key>`
 - 支持流式与非流式响应
-- 支持 Anthropic `tools`
-- 支持图片、PDF、CSV 文件内容块，自动走 Notion 上传链路
+- 同时支持 Anthropic `tools` 与 OpenAI `tools` / `function_call`
+- 图片、PDF、CSV 文件输入会继续复用现有 Notion 上传链路
 - 请求里未指定 `model` 时，自动回退到 `proxy.default_model`
+- `/v1/responses` 暂不支持 `previous_response_id`（当前实现是无状态桥接）
 
 <p align="center">
   <img src="img/cherry.jpg" alt="Cherry Studio" width="480"><br>
