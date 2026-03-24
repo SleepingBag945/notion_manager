@@ -576,6 +576,12 @@ func detectToolBridgeNoToolResponse(text string) bool {
 	lower := strings.ToLower(normalized)
 	mentionsNotionIdentity := strings.Contains(normalized, "我是 Notion AI") ||
 		strings.Contains(lower, "i am notion ai")
+	mentionsDroidRoleRefusal := strings.Contains(normalized, "不是 Droid") ||
+		strings.Contains(normalized, "无法扮演其他 AI 角色") ||
+		strings.Contains(normalized, "无法扮演其他AI角色") ||
+		strings.Contains(lower, "not droid") ||
+		strings.Contains(lower, "cannot act as another ai") ||
+		strings.Contains(lower, "cannot pretend to be another ai")
 	mentionsLocalFS := strings.Contains(normalized, "本地文件系统") ||
 		strings.Contains(lower, "local file system")
 	mentionsCodingAssistant := strings.Contains(normalized, "编码助手") ||
@@ -592,6 +598,8 @@ func detectToolBridgeNoToolResponse(text string) bool {
 		strings.Contains(lower, "bash")
 
 	switch {
+	case mentionsNotionIdentity && mentionsDroidRoleRefusal:
+		return true
 	case mentionsNotionIdentity && mentionsLocalFS:
 		return true
 	case mentionsLocalFS && mentionsCodingAssistant:

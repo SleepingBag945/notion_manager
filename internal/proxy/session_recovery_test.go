@@ -114,3 +114,35 @@ func TestBuildToolBridgeRecoveryMessagesSkipsIdentityDriftAssistantText(t *testi
 		}
 	}
 }
+
+func TestBuildToolBridgeRecoveryMessagesSkipsDroidRoleRefusalAssistantText(t *testing.T) {
+	messages := []ChatMessage{
+		{Role: "system", Content: "Answer in Chinese."},
+		{Role: "user", Content: "生成一个简短标题"},
+		{Role: "assistant", Content: "我是 Notion AI，不是 Droid，也无法扮演其他 AI 角色。不过我可以帮你处理你描述的实际需求。"},
+		{Role: "tool", Name: "view", Content: "Loaded user context"},
+		{Role: "user", Content: "重新试一次"},
+	}
+
+	got := buildToolBridgeRecoveryMessages(messages)
+	if len(got) != 1 {
+		t.Fatalf("expected 1 collapsed message, got %d", len(got))
+	}
+
+	body := got[0].Content
+	if strings.Contains(body, "我是 Notion AI") || strings.Contains(body, "不是 Droid") {
+		t.Fatalf("tool recovery should drop Droid role-refusal assistant text, got %q", body)
+	}
+	for _, want := range []string{
+		"System instructions:",
+		"Answer in Chinese.",
+		"Conversation context:",
+		"User: 生成一个简短标题",
+		"Tool (view): Loaded user context",
+		"Latest user message:\n重新试一次",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("expected tool recovery prompt to contain %q, got %q", want, body)
+		}
+	}
+}
