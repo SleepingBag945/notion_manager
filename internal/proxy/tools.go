@@ -389,8 +389,11 @@ var (
 	inlineTagRegex       = regexp.MustCompile(`<[a-z][-a-z]*>[^<]*</[a-z][-a-z]*>`)
 	cwdXMLRegex          = regexp.MustCompile(`<cwd>([^<]+)</cwd>`)
 	pwdCommandRegex      = regexp.MustCompile(`(?m)^% pwd\s*\n([^\n]+)`)
+	taggedFileRegex      = regexp.MustCompile(`(?m)^User tagged file:\s*(.+?)\s*$`)
+	taggedContentRegex   = regexp.MustCompile(`(?m)^Contents of (/.+?) \(lines `)
 	bareFilenameRegex    = regexp.MustCompile(`^[A-Za-z0-9._ -]+\.[A-Za-z0-9]{1,16}$`)
 	absolutePathErrRegex = regexp.MustCompile(`(?i)absolute path|absolute file path|must be absolute|绝对路径`)
+	envVarLikeRegex      = regexp.MustCompile(`(?:^|[\x00\n])(?:[A-Z][A-Z0-9_]{1,40})=`)
 )
 
 func stripSystemReminders(content string) string {
@@ -425,6 +428,146 @@ func extractWorkingDirectoryFromMessages(messages []ChatMessage) string {
 	return ""
 }
 
+func extractTaggedFilePathsFromText(content string) []string {
+	var paths []string
+	addPath := func(candidate string) {
+		trimmed := strings.TrimSpace(candidate)
+		if trimmed == "" || !filepath.IsAbs(trimmed) {
+			return
+		}
+		for _, existing := range paths {
+			if existing == trimmed {
+				return
+			}
+		}
+		paths = append(paths, trimmed)
+	}
+
+	for _, match := range taggedFileRegex.FindAllStringSubmatch(content, -1) {
+		if len(match) >= 2 {
+			addPath(match[1])
+		}
+	}
+	for _, match := range taggedContentRegex.FindAllStringSubmatch(content, -1) {
+		if len(match) >= 2 {
+			addPath(match[1])
+		}
+	}
+	return paths
+}
+
+func extractTaggedFilePathsFromMessages(messages []ChatMessage) []string {
+	var paths []string
+	for _, msg := range messages {
+		for _, path := range extractTaggedFilePathsFromText(msg.Content) {
+			seen := false
+			for _, existing := range paths {
+				if existing == path {
+					seen = true
+					break
+				}
+			}
+			if !seen {
+				paths = append(paths, path)
+			}
+		}
+	}
+	return paths
+}
+
+func resolveToolPathCandidate(candidate string, cwd string, taggedPaths []string) string {
+	trimmed := strings.TrimSpace(candidate)
+	if trimmed == "" {
+		return ""
+	}
+	if filepath.IsAbs(trimmed) {
+		return filepath.Clean(trimmed)
+	}
+	if trimmed == "." || trimmed == ".." {
+		return ""
+	}
+
+	cleaned := filepath.Clean(trimmed)
+	normalizedCandidates := map[string]bool{
+		trimmed:                                  true,
+		cleaned:                                  true,
+		"./" + strings.TrimPrefix(cleaned, "./"): true,
+	}
+
+	base := filepath.Base(cleaned)
+	for _, tagged := range taggedPaths {
+		taggedClean := filepath.Clean(tagged)
+		if normalizedCandidates[taggedClean] || normalizedCandidates[filepath.Base(taggedClean)] {
+			return taggedClean
+		}
+		if base != "" && filepath.Base(taggedClean) == base {
+			return taggedClean
+		}
+	}
+
+	if cwd == "" {
+		return ""
+	}
+	return filepath.Clean(filepath.Join(cwd, cleaned))
+}
+
+func normalizeToolCallPaths(messages []ChatMessage, toolCalls []ToolCall) []ToolCall {
+	if len(toolCalls) == 0 {
+		return toolCalls
+	}
+
+	cwd := extractWorkingDirectoryFromMessages(messages)
+	taggedPaths := extractTaggedFilePathsFromMessages(messages)
+
+	normalizeStringField := func(fnName string, args map[string]interface{}, key string) bool {
+		raw, ok := args[key].(string)
+		if !ok {
+			return false
+		}
+		resolved := resolveToolPathCandidate(raw, cwd, taggedPaths)
+		if resolved == "" || resolved == raw {
+			return false
+		}
+		log.Printf("[bridge] normalized %s.%s path %q → %q", fnName, key, raw, resolved)
+		args[key] = resolved
+		return true
+	}
+
+	normalized := make([]ToolCall, 0, len(toolCalls))
+	for _, tc := range toolCalls {
+		argsJSON := strings.TrimSpace(tc.Function.Arguments)
+		if argsJSON == "" || !json.Valid([]byte(argsJSON)) {
+			normalized = append(normalized, tc)
+			continue
+		}
+
+		var args map[string]interface{}
+		if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
+			normalized = append(normalized, tc)
+			continue
+		}
+
+		changed := false
+		switch tc.Function.Name {
+		case "Read", "Edit", "Write", "MultiEdit":
+			changed = normalizeStringField(tc.Function.Name, args, "file_path") || changed
+		case "Grep":
+			changed = normalizeStringField(tc.Function.Name, args, "path") || changed
+		case "Glob", "LS":
+			changed = normalizeStringField(tc.Function.Name, args, "folder") || changed
+		}
+
+		if changed {
+			if data, err := json.Marshal(args); err == nil {
+				tc.Function.Arguments = string(data)
+			}
+		}
+		normalized = append(normalized, tc)
+	}
+
+	return normalized
+}
+
 func hasReadAbsolutePathFailure(messages []ChatMessage) bool {
 	for _, msg := range messages {
 		if msg.Role != "tool" || msg.Name != "Read" {
@@ -435,6 +578,47 @@ func hasReadAbsolutePathFailure(messages []ChatMessage) bool {
 		}
 	}
 	return false
+}
+
+func isSuspiciousReadOutput(content string) bool {
+	if content == "" {
+		return false
+	}
+
+	if strings.ContainsRune(content, '\x00') || strings.Contains(content, `\u0000`) {
+		envHits := envVarLikeRegex.FindAllStringIndex(content, -1)
+		if len(envHits) >= 2 {
+			return true
+		}
+	}
+
+	if strings.HasPrefix(content, "SHELL=") || strings.HasPrefix(content, "PATH=") || strings.HasPrefix(content, "PWD=") {
+		return true
+	}
+
+	envHits := envVarLikeRegex.FindAllStringIndex(content, -1)
+	return len(envHits) >= 6
+}
+
+func hasSuspiciousReadOutput(messages []ChatMessage, lastAssistantIdx int) bool {
+	for i, msg := range messages {
+		if msg.Role != "tool" || i <= lastAssistantIdx || msg.Name != "Read" {
+			continue
+		}
+		if isSuspiciousReadOutput(msg.Content) {
+			return true
+		}
+	}
+	return false
+}
+
+func sanitizeToolResultForFollowUp(name, content string) (string, bool, bool) {
+	needsReadNarrowing := name == "Read" && strings.Contains(content, "exceeds maximum allowed tokens")
+	suspiciousRead := name == "Read" && isSuspiciousReadOutput(content)
+	if suspiciousRead {
+		return "Read output omitted because it looks like environment or binary data, not file contents.", needsReadNarrowing, true
+	}
+	return content, needsReadNarrowing, false
 }
 
 func looksLikeResolvedPath(candidate string) bool {
@@ -481,24 +665,43 @@ func extractSinglePathCandidate(content string) (string, bool) {
 }
 
 func buildReadRetryGuidance(messages []ChatMessage, lastAssistantIdx int, cwd string, resolveName func(ChatMessage) string) string {
-	if cwd == "" || !hasReadAbsolutePathFailure(messages) {
+	hasAbsFailure := hasReadAbsolutePathFailure(messages)
+	hasSuspiciousRead := hasSuspiciousReadOutput(messages, lastAssistantIdx)
+	if !hasAbsFailure && !hasSuspiciousRead {
 		return ""
 	}
 
-	for i, msg := range messages {
-		if msg.Role != "tool" || i <= lastAssistantIdx {
-			continue
+	findPathCandidate := func(afterLastAssistantOnly bool) (string, string, bool) {
+		for i := len(messages) - 1; i >= 0; i-- {
+			msg := messages[i]
+			if msg.Role != "tool" {
+				continue
+			}
+			if afterLastAssistantOnly && i <= lastAssistantIdx {
+				continue
+			}
+			toolName := resolveName(msg)
+			if toolName != "Grep" && toolName != "Glob" {
+				continue
+			}
+			pathCandidate, ok := extractSinglePathCandidate(msg.Content)
+			if ok {
+				return toolName, pathCandidate, true
+			}
 		}
-		toolName := resolveName(msg)
-		if toolName != "Grep" && toolName != "Glob" {
-			continue
-		}
-		pathCandidate, ok := extractSinglePathCandidate(msg.Content)
-		if !ok {
-			continue
-		}
+		return "", "", false
+	}
+
+	toolName, pathCandidate, ok := findPathCandidate(true)
+	if !ok {
+		toolName, pathCandidate, ok = findPathCandidate(false)
+	}
+	if ok {
 		absolutePath := pathCandidate
 		if !filepath.IsAbs(absolutePath) {
+			if cwd == "" {
+				return ""
+			}
 			absolutePath = filepath.Clean(filepath.Join(cwd, pathCandidate))
 		}
 		call := map[string]interface{}{
@@ -508,9 +711,16 @@ func buildReadRetryGuidance(messages []ChatMessage, lastAssistantIdx int, cwd st
 			},
 		}
 		payload, _ := json.Marshal(call)
+		reason := "the previous Read failed because it required an absolute path."
+		switch {
+		case hasAbsFailure && hasSuspiciousRead:
+			reason = "the previous Read flow is invalid: one Read required an absolute path and the latest Read output looks like environment data instead of file contents."
+		case hasSuspiciousRead:
+			reason = "the latest Read output looks like environment data instead of file contents."
+		}
 		return fmt.Sprintf(
-			"Path recovery hint: the previous Read failed because it required an absolute path. The latest %s result looks like a file path, not file contents (%s). Do NOT use __done__ yet. Prefer this next call:\n%s\n",
-			toolName, pathCandidate, string(payload),
+			"Path recovery hint: %s The latest %s result looks like a file path, not file contents (%s). Do NOT use __done__ yet. Prefer this next call:\n%s\n",
+			reason, toolName, pathCandidate, string(payload),
 		)
 	}
 
@@ -747,9 +957,12 @@ func injectToolsIntoMessages(messages []ChatMessage, tools []Tool, model string,
 				name := resolveName(m)
 				if i > lastAssistantIdx && lastAssistantIdx >= 0 {
 					// Latest round: include full content
-					content := m.Content
-					if name == "Read" && strings.Contains(content, "exceeds maximum allowed tokens") {
+					content, oversizeRead, suspiciousRead := sanitizeToolResultForFollowUp(name, m.Content)
+					if oversizeRead {
 						needsReadNarrowing = true
+					}
+					if suspiciousRead {
+						log.Printf("[bridge] chain: sanitized suspicious Read output before follow-up")
 					}
 					if len(content) > 800 {
 						content = content[:800] + "..."
@@ -761,7 +974,8 @@ func injectToolsIntoMessages(messages []ChatMessage, tools []Tool, model string,
 				} else {
 					// Earlier rounds in this chain: brief summary
 					status := "ok"
-					if strings.Contains(m.Content, "error") || strings.Contains(m.Content, "Error") {
+					_, _, suspiciousRead := sanitizeToolResultForFollowUp(name, m.Content)
+					if strings.Contains(m.Content, "error") || strings.Contains(m.Content, "Error") || suspiciousRead {
 						status = "error"
 					}
 					if prevRoundSummary.Len() > 0 {
@@ -1087,9 +1301,12 @@ func buildSessionChainFollowUp(messages []ChatMessage, compactList string, cwd s
 			continue
 		}
 		name := resolveName(m)
-		content := m.Content
-		if name == "Read" && strings.Contains(content, "exceeds maximum allowed tokens") {
+		content, oversizeRead, suspiciousRead := sanitizeToolResultForFollowUp(name, m.Content)
+		if oversizeRead {
 			needsReadNarrowing = true
+		}
+		if suspiciousRead {
+			log.Printf("[bridge] session chain: sanitized suspicious Read output before follow-up")
 		}
 		if len(content) > 4000 {
 			content = content[:4000] + "\n... (truncated)"

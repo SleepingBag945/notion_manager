@@ -782,6 +782,7 @@ func HandleAnthropicMessages(pool *AccountPool) http.HandlerFunc {
 
 		// Log converted internal messages
 		logConvertedMessages(messages)
+		rawMessages := append([]ChatMessage(nil), messages...)
 
 		// Detect researcher mode — skip tools and file uploads
 		isResearcher := IsResearcherModel(model)
@@ -1005,9 +1006,9 @@ func HandleAnthropicMessages(pool *AccountPool) http.HandlerFunc {
 					reqErr = handleResearcherNonStream(w, acc, requestMessages, model, requestID, hasThinking)
 				}
 			} else if req.Stream {
-				reqErr = handleAnthropicStream(w, acc, requestMessages, model, requestID, hasTools, hasThinking, enableWebSearch, enableWorkspaceSearch, uploadedAttachments, req.OutputConfig, currentSession)
+				reqErr = handleAnthropicStream(w, acc, requestMessages, rawMessages, model, requestID, hasTools, hasThinking, enableWebSearch, enableWorkspaceSearch, uploadedAttachments, req.OutputConfig, currentSession)
 			} else {
-				reqErr = handleAnthropicNonStream(w, acc, requestMessages, model, requestID, hasTools, hasThinking, enableWebSearch, enableWorkspaceSearch, uploadedAttachments, req.OutputConfig, currentSession)
+				reqErr = handleAnthropicNonStream(w, acc, requestMessages, rawMessages, model, requestID, hasTools, hasThinking, enableWebSearch, enableWorkspaceSearch, uploadedAttachments, req.OutputConfig, currentSession)
 			}
 
 			if reqErr != nil && errors.Is(reqErr, ErrResearchQuotaExhausted) {
@@ -1591,7 +1592,7 @@ func streamAnthropicTextResponse(w http.ResponseWriter, acc *Account, messages [
 }
 
 // handleAnthropicStream handles streaming Anthropic response
-func handleAnthropicStream(w http.ResponseWriter, acc *Account, messages []ChatMessage, model, requestID string, hasTools bool, hasThinking bool, enableWebSearch bool, enableWorkspaceSearch *bool, attachments []UploadedAttachment, outputConfig *AnthropicOutputConfig, session *Session) error {
+func handleAnthropicStream(w http.ResponseWriter, acc *Account, messages []ChatMessage, rawMessages []ChatMessage, model, requestID string, hasTools bool, hasThinking bool, enableWebSearch bool, enableWorkspaceSearch *bool, attachments []UploadedAttachment, outputConfig *AnthropicOutputConfig, session *Session) error {
 	var fullContent strings.Builder
 	var finalUsage *UsageInfo
 	var nativeToolUses []AgentValueEntry
@@ -1654,6 +1655,7 @@ func handleAnthropicStream(w http.ResponseWriter, acc *Account, messages []ChatM
 	var prepared preparedToolBridgeResponse
 	if hasTools {
 		prepared = prepareToolBridgeResponse(contentStr, nativeToolUses)
+		prepared.ToolCalls = normalizeToolCallPaths(rawMessages, prepared.ToolCalls)
 		actionDetected := prepared.HasCalls || prepared.WebSearchQuery != "" || prepared.DoneText != ""
 		if !actionDetected && detectToolBridgeNoToolResponse(prepared.Remaining) {
 			log.Printf("[bridge] %s detected no-tool identity-drift text (%d chars), requesting clean retry", requestID, len(prepared.Remaining))
@@ -1863,7 +1865,7 @@ func handleAnthropicStream(w http.ResponseWriter, acc *Account, messages []ChatM
 }
 
 // handleAnthropicNonStream handles non-streaming Anthropic response
-func handleAnthropicNonStream(w http.ResponseWriter, acc *Account, messages []ChatMessage, model, requestID string, hasTools bool, hasThinking bool, enableWebSearch bool, enableWorkspaceSearch *bool, attachments []UploadedAttachment, outputConfig *AnthropicOutputConfig, session *Session) error {
+func handleAnthropicNonStream(w http.ResponseWriter, acc *Account, messages []ChatMessage, rawMessages []ChatMessage, model, requestID string, hasTools bool, hasThinking bool, enableWebSearch bool, enableWorkspaceSearch *bool, attachments []UploadedAttachment, outputConfig *AnthropicOutputConfig, session *Session) error {
 	var fullContent strings.Builder
 	var finalUsage *UsageInfo
 	var nativeToolUses []AgentValueEntry
@@ -1939,6 +1941,7 @@ func handleAnthropicNonStream(w http.ResponseWriter, acc *Account, messages []Ch
 	var prepared preparedToolBridgeResponse
 	if hasTools {
 		prepared = prepareToolBridgeResponse(content, nativeToolUses)
+		prepared.ToolCalls = normalizeToolCallPaths(rawMessages, prepared.ToolCalls)
 		actionDetected := prepared.HasCalls || prepared.WebSearchQuery != "" || prepared.DoneText != ""
 		if !actionDetected && detectToolBridgeNoToolResponse(prepared.Remaining) {
 			log.Printf("[bridge] %s detected no-tool identity-drift text (%d chars), requesting clean retry", requestID, len(prepared.Remaining))
@@ -2009,6 +2012,15 @@ func handleAnthropicNonStream(w http.ResponseWriter, acc *Account, messages []Ch
 					doneText = "Web search failed: " + searchErr.Error()
 				}
 			}
+		}
+
+		if hasCalls {
+			var keptCalls []ToolCall
+			for _, tc := range toolCalls {
+				keptCalls = append(keptCalls, tc)
+			}
+			toolCalls = keptCalls
+			hasCalls = len(toolCalls) > 0
 		}
 
 		// When tool actions were detected, suppress residual framing / identity text.
