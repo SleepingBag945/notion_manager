@@ -1,18 +1,76 @@
+const STRINGS = {
+  zh: {
+    subtitle: '一键提取账号配置，用于 Notion AI Proxy',
+    statusInitial: '点击下方按钮，在 Notion 页面上提取账号配置。',
+    extractBtn: '⚡ 提取配置',
+    copyBtn: '📋 复制 JSON 配置',
+    extracting: '<span class="spinner"></span>正在提取配置...',
+    noCookies: '未找到 notion.so cookies。请先登录 Notion。',
+    noToken: '未找到 token_v2 cookie。请先登录 Notion。',
+    cookiesSuccess: '<span class="spinner"></span>已获取 cookies，正在获取用户数据...',
+    openNotionFirst: '请先打开 Notion 页面 (notion.so)，然后重试。',
+    noWorkspace: '未找到可用空间',
+    extractFailed: '提取失败',
+    success: '✅ 配置提取成功！',
+    copied: '✅ 已复制！',
+    labelUser: '用户',
+    labelWorkspace: '空间',
+    labelTimezone: '时区',
+    labelVersion: '版本',
+    labelToken: 'Token'
+  },
+  en: {
+    subtitle: 'One-click account config extractor for Notion AI Proxy',
+    statusInitial: 'Click the button below to extract the account configuration on the Notion page.',
+    extractBtn: '⚡ Extract Config',
+    copyBtn: '📋 Copy JSON Config',
+    extracting: '<span class="spinner"></span>Extracting configuration...',
+    noCookies: 'No notion.so cookies found. Please log in to Notion first.',
+    noToken: 'No token_v2 cookie found. Please log in to Notion first.',
+    cookiesSuccess: '<span class="spinner"></span>Cookies retrieved, fetching user data...',
+    openNotionFirst: 'Please open the Notion page (notion.so) first, then try again.',
+    noWorkspace: 'No accessible workspace found',
+    extractFailed: 'Extraction failed',
+    success: '✅ Configuration extracted successfully!',
+    copied: '✅ Copied!',
+    labelUser: 'User',
+    labelWorkspace: 'Workspace',
+    labelTimezone: 'Timezone',
+    labelVersion: 'Version',
+    labelToken: 'Token'
+  }
+};
+
+let currentLang = localStorage.getItem('notion-ext-lang') || 'zh';
+
+function updateUI() {
+  const s = STRINGS[currentLang];
+  document.getElementById('subtitle').textContent = s.subtitle;
+  const statusEl = document.getElementById('status');
+  if (statusEl.className === 'status info') {
+    statusEl.textContent = s.statusInitial;
+  }
+  document.getElementById('extractBtn').textContent = s.extractBtn;
+  document.getElementById('copyBtn').textContent = s.copyBtn;
+  document.getElementById('langToggleBtn').textContent = currentLang === 'zh' ? '🌐 EN' : '🌐 中文';
+}
+
 async function extract() {
   const statusEl = document.getElementById('status');
   const extractBtn = document.getElementById('extractBtn');
   const resultEl = document.getElementById('result');
+  const s = STRINGS[currentLang];
 
   extractBtn.disabled = true;
   statusEl.className = 'status loading';
-  statusEl.innerHTML = '<span class="spinner"></span>正在提取配置...';
+  statusEl.innerHTML = s.extracting;
 
   try {
     // Step 1: Get all cookies via chrome.cookies API (can read HttpOnly!)
     const allCookies = await new Promise((resolve, reject) => {
       chrome.cookies.getAll({ domain: 'notion.so' }, (cookies) => {
         if (cookies && cookies.length > 0) resolve(cookies);
-        else reject(new Error('未找到 notion.so cookies。请先登录 Notion。'));
+        else reject(new Error(s.noCookies));
       });
     });
 
@@ -20,7 +78,7 @@ async function extract() {
     for (const c of allCookies) cookieMap[c.name] = c.value;
 
     const token = cookieMap['token_v2'];
-    if (!token) throw new Error('未找到 token_v2 cookie。请先登录 Notion。');
+    if (!token) throw new Error(s.noToken);
 
     const browserId = cookieMap['notion_browser_id'] || '';
     const deviceId = cookieMap['device_id'] || '';
@@ -29,13 +87,13 @@ async function extract() {
     // Generate a browser_id if cookie doesn't exist
     const effectiveBrowserId = browserId || crypto.randomUUID();
 
-    statusEl.innerHTML = '<span class="spinner"></span>已获取 cookies，正在获取用户数据...';
+    statusEl.innerHTML = s.cookiesSuccess;
 
     // Step 2: Get active tab and inject script to call Notion APIs
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
 
     if (!tab?.url?.includes('notion.so')) {
-      throw new Error('请先打开 Notion 页面 (notion.so)，然后重试。');
+      throw new Error(s.openNotionFirst);
     }
 
     // Step 3: Inject content script to call APIs with credentials
@@ -150,7 +208,7 @@ async function extract() {
     });
 
     if (!accountData?.success) {
-      throw new Error(accountData?.error || '提取失败');
+      throw new Error(accountData?.error || s.extractFailed);
     }
 
     // Step 4: Assemble final config
@@ -174,15 +232,15 @@ async function extract() {
 
     // Step 5: Display results
     statusEl.className = 'status success';
-    statusEl.textContent = '✅ 配置提取成功！';
+    statusEl.textContent = s.success;
 
     const infoRows = document.getElementById('infoRows');
     infoRows.innerHTML = [
-      ['用户', `${config.user_name} (${config.user_email})`],
-      ['空间', `${config.space_name} (${config.plan_type})`],
-      ['时区', config.timezone],
-      ['版本', config.client_version],
-      ['Token', config.token_v2.substring(0, 20) + '...'],
+      [s.labelUser, `${config.user_name} (${config.user_email})`],
+      [s.labelWorkspace, `${config.space_name} (${config.plan_type})`],
+      [s.labelTimezone, config.timezone],
+      [s.labelVersion, config.client_version],
+      [s.labelToken, config.token_v2.substring(0, 20) + '...'],
     ].map(([label, value]) =>
       `<div class="info-row"><span class="info-label">${label}</span><span class="info-value">${value}</span></div>`
     ).join('');
@@ -208,13 +266,21 @@ function copyConfig() {
   document.execCommand('copy');
 
   const btn = document.getElementById('copyBtn');
-  btn.textContent = '✅ 已复制！';
+  btn.textContent = STRINGS[currentLang].copied;
   btn.classList.add('copied');
   setTimeout(() => {
-    btn.textContent = '📋 复制 JSON 配置';
+    btn.textContent = STRINGS[currentLang].copyBtn;
     btn.classList.remove('copied');
   }, 2000);
 }
 
 document.getElementById('extractBtn').addEventListener('click', extract);
 document.getElementById('copyBtn').addEventListener('click', copyConfig);
+document.getElementById('langToggleBtn').addEventListener('click', () => {
+  currentLang = currentLang === 'zh' ? 'en' : 'zh';
+  localStorage.setItem('notion-ext-lang', currentLang);
+  updateUI();
+});
+
+// Call updateUI on load
+document.addEventListener('DOMContentLoaded', updateUI);

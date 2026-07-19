@@ -89,10 +89,14 @@ export function getQuotaPct(usage?: number, limit?: number): number {
   return Math.min(((usage || 0) / limit) * 100, 100)
 }
 
+import i18n from './i18n'
+
+const getLocale = () => i18n.language === 'zh' ? 'zh-CN' : 'en-US'
+
 export function formatCheckedAt(iso?: string): string {
   if (!iso) return '—'
   try {
-    return new Date(iso).toLocaleString('zh-CN', {
+    return new Date(iso).toLocaleString(getLocale(), {
       month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit',
     })
   } catch {
@@ -103,7 +107,7 @@ export function formatCheckedAt(iso?: string): string {
 export function formatTimestampMs(ms?: number): string {
   if (!ms) return '—'
   try {
-    return new Date(ms).toLocaleString('zh-CN', {
+    return new Date(ms).toLocaleString(getLocale(), {
       month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit',
     })
   } catch {

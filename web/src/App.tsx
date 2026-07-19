@@ -1,4 +1,5 @@
 import { useState, useEffect, useMemo, useCallback, useRef } from 'react'
+import { useTranslation } from 'react-i18next'
 import type { DashboardData, AccountInfo, AccountSummary, RefreshStatus, TokenStats } from './types'
 import { fetchDashboardData, openProxy, openBestProxy, checkAuth, login, logout, triggerRefresh, fetchSettings, updateSettings, addAccount, fetchTokenStats } from './api'
 import type { SearchSettings } from './api'
@@ -6,6 +7,7 @@ import { fmt, formatTokens, getQuotaStatusByUsage, getQuotaPct, avatarColor, ava
 import { AccountMenu } from './components/AccountMenu'
 import { RegisterModal } from './components/RegisterModal'
 import { HistoryDrawer } from './components/HistoryDrawer'
+import { LanguageToggle } from './components/LanguageToggle'
 import { IconUserPlus, IconHistory } from './components/Icons'
 
 // --- Icons ---
@@ -64,6 +66,7 @@ const IconTrash = () => (
 // --- Add Account Modal ---
 
 function AddAccountModal({ onClose, onSuccess }: { onClose: () => void; onSuccess: () => void }) {
+  const { t } = useTranslation()
   const [token, setToken] = useState('')
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
@@ -97,7 +100,7 @@ function AddAccountModal({ onClose, onSuccess }: { onClose: () => void; onSucces
         }, 1500)
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : '请求失败')
+      setError(err instanceof Error ? err.message : t('modal.register.submit_failed'))
     } finally {
       setLoading(false)
     }
@@ -107,13 +110,13 @@ function AddAccountModal({ onClose, onSuccess }: { onClose: () => void; onSucces
     <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/60 backdrop-blur-sm" onClick={onClose}>
       <div className="w-full max-w-lg bg-[#1a1a1a] border border-white/10 rounded-xl shadow-2xl p-6" onClick={e => e.stopPropagation()}>
         <div className="flex items-center justify-between mb-4">
-          <h2 className="text-[16px] font-semibold">添加 Notion 账号</h2>
+          <h2 className="text-[16px] font-semibold">{t('modal.add.title')}</h2>
           <button onClick={onClose} className="text-text-muted hover:text-white bg-transparent border-none cursor-pointer text-lg px-1">×</button>
         </div>
 
         <div className="text-[12px] text-text-secondary mb-4 space-y-1.5">
-          <p>粘贴你的 <code className="bg-white/[.08] px-1 py-0.5 rounded text-[11px]">token_v2</code> cookie，系统会自动获取账号信息。</p>
-          <p className="text-text-muted">获取方式：打开 <code className="bg-white/[.08] px-1 py-0.5 rounded text-[11px]">notion.so</code> → F12 → Application → Cookies → 复制 <code className="bg-white/[.08] px-1 py-0.5 rounded text-[11px]">token_v2</code> 的值</p>
+          <p>{t('modal.add.subtitle')}</p>
+          <p className="text-text-muted">{t('modal.add.how_to')}</p>
         </div>
 
         <form onSubmit={handleSubmit}>
@@ -121,7 +124,7 @@ function AddAccountModal({ onClose, onSuccess }: { onClose: () => void; onSucces
             ref={inputRef}
             value={token}
             onChange={e => setToken(e.target.value)}
-            placeholder="粘贴 token_v2 值..."
+            placeholder={t('modal.add.placeholder')}
             rows={3}
             className="w-full py-2.5 px-3 bg-transparent border border-white/10 rounded-lg text-[13px] text-text-primary outline-none focus:border-white/30 focus:ring-1 focus:ring-white/10 transition-all placeholder:text-white/25 resize-none font-mono"
           />
@@ -130,10 +133,10 @@ function AddAccountModal({ onClose, onSuccess }: { onClose: () => void; onSucces
           )}
           {result && (
             <div className="mt-3 p-3 bg-[#0a3d0a]/50 border border-[#1b5e20]/50 rounded-lg text-[12px]">
-              <div className="text-[#4ade80] font-medium mb-1.5">添加成功</div>
+              <div className="text-[#4ade80] font-medium mb-1.5">{t('modal.add.success')}</div>
               <div className="space-y-0.5 text-text-secondary">
-                <div>用户: <span className="text-white">{result.name}</span> ({result.email})</div>
-                <div>空间: <span className="text-white">{result.space}</span> · {result.plan_type}</div>
+                <div>{t('modal.add.user')} <span className="text-white">{result.name}</span> ({result.email})</div>
+                <div>{t('modal.add.space')} <span className="text-white">{result.space}</span> · {result.plan_type}</div>
               </div>
             </div>
           )}
@@ -143,14 +146,14 @@ function AddAccountModal({ onClose, onSuccess }: { onClose: () => void; onSucces
               onClick={onClose}
               className="flex-1 py-2.5 bg-transparent hover:bg-white/5 text-text-secondary rounded-lg text-[13px] font-medium cursor-pointer transition-colors border border-white/10"
             >
-              取消
+              {t('common.cancel')}
             </button>
             <button
               type="submit"
               disabled={loading || !token.trim() || !!result}
               className="flex-1 py-2.5 bg-white hover:bg-white/90 text-black rounded-lg text-[13px] font-semibold cursor-pointer transition-colors border-none disabled:opacity-40 disabled:cursor-not-allowed"
             >
-              {loading ? '正在验证...' : '添加账号'}
+              {loading ? t('modal.add.verifying') : t('actions.add_account')}
             </button>
           </div>
         </form>
@@ -162,6 +165,7 @@ function AddAccountModal({ onClose, onSuccess }: { onClose: () => void; onSucces
 // --- Login Page ---
 
 function LoginPage({ onSuccess }: { onSuccess: () => void }) {
+  const { t } = useTranslation()
   const [password, setPassword] = useState('')
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(false)
@@ -180,11 +184,11 @@ function LoginPage({ onSuccess }: { onSuccess: () => void }) {
         onSuccess()
         return
       }
-      setError(result.error || '密码错误')
+      setError(result.error || t('auth.wrong_password'))
       setPassword('')
       inputRef.current?.focus()
     } catch (err) {
-      setError(err instanceof Error ? err.message : '登录请求失败')
+      setError(err instanceof Error ? err.message : t('auth.login_failed'))
       setPassword('')
       inputRef.current?.focus()
     } finally {
@@ -198,7 +202,7 @@ function LoginPage({ onSuccess }: { onSuccess: () => void }) {
         <div className="flex flex-col items-center mb-8">
           <div className="w-12 h-12 bg-[#1a1a1a] border border-white/10 rounded-xl flex items-center justify-center text-xl font-extrabold text-white mb-4">N</div>
           <h1 className="text-xl font-semibold tracking-tight">notion-manager</h1>
-          <p className="text-[13px] text-text-muted mt-1">输入管理密钥以访问 Dashboard</p>
+          <p className="text-[13px] text-text-muted mt-1">{t('auth.prompt')}</p>
         </div>
         <form onSubmit={handleSubmit}>
           <div className="relative mb-4">
@@ -207,7 +211,7 @@ function LoginPage({ onSuccess }: { onSuccess: () => void }) {
               type="password"
               value={password}
               onChange={e => setPassword(e.target.value)}
-              placeholder="管理密钥"
+              placeholder={t('auth.placeholder')}
               autoComplete="current-password"
               className="w-full py-2.5 px-4 bg-transparent border border-white/10 rounded-lg text-[14px] text-text-primary outline-none focus:border-white/30 focus:ring-1 focus:ring-white/10 transition-all placeholder:text-white/25"
             />
@@ -220,7 +224,7 @@ function LoginPage({ onSuccess }: { onSuccess: () => void }) {
             disabled={loading || !password.trim()}
             className="w-full py-2.5 bg-white hover:bg-white/90 text-black rounded-lg text-[14px] font-semibold cursor-pointer transition-colors border-none disabled:opacity-40 disabled:cursor-not-allowed"
           >
-            {loading ? '验证中...' : '登录'}
+            {loading ? t('auth.logging_in') : t('auth.login')}
           </button>
         </form>
       </div>
@@ -233,6 +237,7 @@ function LoginPage({ onSuccess }: { onSuccess: () => void }) {
 function Header({ query, onQuery, onLogout, authRequired }: {
   query: string; onQuery: (q: string) => void; onLogout: () => void; authRequired: boolean
 }) {
+  const { t } = useTranslation()
   const inputRef = useRef<HTMLInputElement>(null)
 
   useEffect(() => {
@@ -279,18 +284,19 @@ function Header({ query, onQuery, onLogout, authRequired }: {
             ref={inputRef}
             value={query}
             onChange={e => onQuery(e.target.value)}
-            placeholder="搜索账号、邮箱、计划..."
+            placeholder={t('header.search_placeholder')}
             className="w-full py-1.5 pl-8 pr-10 bg-bg-input border border-border rounded-md text-[13px] text-text-primary outline-none focus:border-white/20 transition-colors placeholder:text-text-muted"
           />
           <kbd className="absolute right-2.5 top-1/2 -translate-y-1/2 text-[11px] text-text-muted bg-bg-card border border-border rounded px-1.5 py-0.5">/</kbd>
         </div>
+        <LanguageToggle />
         {authRequired && (
           <button
             onClick={onLogout}
             className="text-[12px] text-text-secondary hover:text-text-primary cursor-pointer transition-colors bg-transparent border-none px-2 py-1"
-            title="退出登录"
+            title={t('header.logout_title')}
           >
-            退出
+            {t('header.logout')}
           </button>
         )}
       </div>
@@ -344,6 +350,7 @@ function mergeQuotaStatus(statuses: Array<'ok' | 'low' | 'exhausted'>): 'ok' | '
 }
 
 function OverviewBar({ label, usage, limit }: { label: string; usage: number; limit: number }) {
+  const { t } = useTranslation()
   const pct = getQuotaPct(usage, limit)
   const remaining = Math.max(limit - usage, 0)
   const status = getQuotaStatusByUsage(usage, limit)
@@ -357,7 +364,7 @@ function OverviewBar({ label, usage, limit }: { label: string; usage: number; li
       <div className="flex justify-between items-center mb-1.5">
         <span className="text-[10px] text-text-muted uppercase tracking-wider">{label}</span>
         <span className={`text-[11px] font-semibold tabular-nums ${numColor}`}>
-          {fmt(remaining)} <span className="text-text-muted font-normal">/ {fmt(limit)} 剩余</span>
+          {fmt(remaining)} <span className="text-text-muted font-normal">/ {fmt(limit)} {t('stats.remaining')}</span>
         </span>
       </div>
       <div className="h-[2px] bg-white/[.06] rounded-full overflow-hidden">
@@ -368,6 +375,7 @@ function OverviewBar({ label, usage, limit }: { label: string; usage: number; li
 }
 
 function TotalQuotaBar({ summary }: { summary?: AccountSummary | null }) {
+  const { t } = useTranslation()
   const totalSpaceUsage = summary?.total_space_usage ?? 0
   const totalSpaceLimit = summary?.total_space_limit ?? 0
   const totalUserUsage = summary?.total_user_usage ?? 0
@@ -382,10 +390,10 @@ function TotalQuotaBar({ summary }: { summary?: AccountSummary | null }) {
   return (
     <div className="mb-5 space-y-3">
       <div className="flex justify-between items-center">
-        <span className="text-[11px] text-text-secondary uppercase tracking-wider flex items-center gap-1.5"><IconBarChart /> Basic 额度概览</span>
+        <span className="text-[11px] text-text-secondary uppercase tracking-wider flex items-center gap-1.5"><IconBarChart /> {t('stats.basic_overview')}</span>
         {totalPremiumLimit > 0 && (
           <span className="text-[12px] text-text-muted tabular-nums">
-            Premium 剩余 <span className="text-[#7eb8ff] font-semibold">{fmt(totalPremiumBalance)}</span> / {fmt(totalPremiumLimit)}
+            {t('stats.premium_remaining')} <span className="text-[#7eb8ff] font-semibold">{fmt(totalPremiumBalance)}</span> / {fmt(totalPremiumLimit)}
           </span>
         )}
       </div>
@@ -440,6 +448,7 @@ function Badge({ children, variant }: { children: React.ReactNode; variant: 'pla
 }
 
 function AccountCard({ account, onChanged }: { account: AccountInfo; onChanged: () => void }) {
+  const { t } = useTranslation()
   const [showModels, setShowModels] = useState(false)
   const spaceQuota = getSpaceQuota(account)
   const userQuota = getUserQuota(account)
@@ -468,7 +477,7 @@ function AccountCard({ account, onChanged }: { account: AccountInfo; onChanged: 
     if (noWorkspace) {
       // Use a native alert — we don't have a toast infra and openProxy
       // would otherwise pop a tab that displays raw JSON 409 to the user.
-      alert('该账号没有可访问的 Notion 工作区，无法打开 /ai 反代。请重新注册或选择其他账号。')
+      alert(t('account.no_workspace_alert'))
       return
     }
     openProxy(account.email)
@@ -478,7 +487,7 @@ function AccountCard({ account, onChanged }: { account: AccountInfo; onChanged: 
     <div
       className={`rounded-lg p-4 border ${noWorkspace ? 'cursor-not-allowed' : 'cursor-pointer hover:-translate-y-0.5 hover:shadow-lg hover:shadow-black/30'} transition-all duration-200 ${cardBg}`}
       onClick={handleClick}
-      title={noWorkspace ? '账号无可访问工作区，已被排除出选号池' : undefined}
+      title={noWorkspace ? t('account.no_workspace_tooltip') : undefined}
     >
       {/* Header */}
       <div className="flex items-center gap-2.5 mb-2.5">
@@ -510,12 +519,12 @@ function AccountCard({ account, onChanged }: { account: AccountInfo; onChanged: 
         {premium && <Badge variant="premium">AI Premium</Badge>}
         {(account.research_usage != null && account.research_usage > 0) && (
           <Badge variant={researchLimited ? 'warning' : 'research'}>
-            <IconFlask /> Research 已用 {account.research_usage}{premium ? '' : '/3'}
+            <IconFlask /> Research {t('account.used', { count: account.research_usage })}{premium ? '' : '/3'}
           </Badge>
         )}
         {account.exhausted && !account.permanent && <Badge variant="warning">Basic blocked</Badge>}
         {account.permanent && <Badge variant="warning">Free cap</Badge>}
-        {noWorkspace && <Badge variant="warning">无工作区</Badge>}
+        {noWorkspace && <Badge variant="warning">{t('account.no_workspace')}</Badge>}
         {modelCount > 0 && (
           <button
             onClick={e => { e.stopPropagation(); setShowModels(!showModels) }}
@@ -537,8 +546,8 @@ function AccountCard({ account, onChanged }: { account: AccountInfo; onChanged: 
       )}
       {premium && <QuotaBar label="Premium" labelClass="text-[#7eb8ff]" usage={account.premium_usage} limit={account.premium_limit} />}
       <div className="flex flex-wrap gap-3 mt-2 text-[10px] text-text-muted">
-        <span>Basic 剩余 {fmt(account.remaining || 0)}</span>
-        {premium && <span>Premium 剩余 {fmt(account.premium_balance || 0)}</span>}
+        <span>{t('account.basic_remaining')} {fmt(account.remaining || 0)}</span>
+        {premium && <span>{t('account.premium_remaining')} {fmt(account.premium_balance || 0)}</span>}
       </div>
 
       {/* Models (expandable) */}
@@ -556,12 +565,12 @@ function AccountCard({ account, onChanged }: { account: AccountInfo; onChanged: 
       <div className="flex justify-between items-center mt-2 pt-2 border-t border-border">
         <span className="text-[10px] text-text-muted flex items-center gap-1 min-w-0">
           <IconClock />
-          <span className="truncate">检查 {formatCheckedAt(account.checked_at)} · 最近 AI {formatTimestampMs(account.last_usage_at)}</span>
+          <span className="truncate">{t('account.last_checked', { date: formatCheckedAt(account.checked_at) })} · {t('account.recent_ai', { date: formatTimestampMs(account.last_usage_at) })}</span>
         </span>
         {noWorkspace ? (
-          <span className="text-[11px] text-err font-medium">不可用 ⚠</span>
+          <span className="text-[11px] text-err font-medium">{t('account.unavailable')}</span>
         ) : (
-          <span className="text-[11px] text-text-secondary hover:text-white font-medium transition-colors">打开代理 →</span>
+          <span className="text-[11px] text-text-secondary hover:text-white font-medium transition-colors">{t('account.open_proxy')}</span>
         )}
       </div>
     </div>
@@ -569,6 +578,7 @@ function AccountCard({ account, onChanged }: { account: AccountInfo; onChanged: 
 }
 
 export default function App() {
+  const { t, i18n } = useTranslation()
   const [authState, setAuthState] = useState<'checking' | 'login' | 'authenticated'>('checking')
   const [authRequired, setAuthRequired] = useState(false)
   const [data, setData] = useState<DashboardData | null>(null)
@@ -633,7 +643,8 @@ export default function App() {
       const d = await fetchDashboardData({ page, pageSize: PAGE_SIZE, query: debouncedQuery })
       setData(d)
       setError(null)
-      setRefreshTime(new Date().toLocaleTimeString('zh-CN'))
+      const dateLocale = i18n.language === 'zh' ? 'zh-CN' : 'en-US'
+      setRefreshTime(new Date().toLocaleTimeString(dateLocale))
       if (d.refresh) {
         setRefreshStatus(d.refresh)
       }
@@ -642,7 +653,7 @@ export default function App() {
     } finally {
       setLoading(false)
     }
-  }, [page, debouncedQuery])
+  }, [page, debouncedQuery, i18n.language])
 
   useEffect(() => {
     if (authState === 'authenticated') loadData()
@@ -713,7 +724,7 @@ export default function App() {
       setSettings(updated)
       setProxyDraft(updated.notion_proxy ?? '')
     } catch (e: any) {
-      setProxyError(e?.message || '保存失败')
+      setProxyError(e?.message || t('api.save_failed'))
       setProxyDraft(settings.notion_proxy ?? '')
     } finally {
       setProxySaving(false)
@@ -793,7 +804,7 @@ export default function App() {
     return (
       <div className="flex items-center justify-center h-screen gap-3 text-text-secondary text-sm">
         <div className="w-4 h-4 border-2 border-border border-t-notion-blue rounded-full animate-spin" />
-        加载账号数据...
+        {t('common.loading_accounts')}
       </div>
     )
   }
@@ -801,10 +812,12 @@ export default function App() {
   if (error && !data) {
     return (
       <div className="flex items-center justify-center h-screen text-err text-sm">
-        加载失败: {error}
+        {t('common.load_failed', { error })}
       </div>
     )
   }
+
+  const dateLocale = i18n.language === 'zh' ? 'zh-CN' : 'en-US'
 
   return (
     <div className="min-h-screen">
@@ -815,36 +828,36 @@ export default function App() {
         {summary && (
           <div className="grid grid-cols-5 divide-x divide-white/[.05] mb-6 max-lg:grid-cols-3 max-md:grid-cols-2 max-md:divide-x-0 max-sm:grid-cols-1">
             <StatCard
-              label="总账号" value={data!.total}
+              label={t('stats.total_accounts')} value={data!.total}
               sub={summary.noWorkspace > 0
-                ? `${data!.available} 可用 / ${summary.exhaustedOnly} 耗尽 / ${summary.noWorkspace} 无工作区`
-                : `${data!.available} 可用 / ${summary.exhausted} 耗尽`}
+                ? t('stats.available_spent_no_workspace', { available: data!.available, spent: summary.exhaustedOnly, noWorkspace: summary.noWorkspace })
+                : t('stats.available_spent_no_workspace', { available: data!.available, spent: summary.exhausted, noWorkspace: 0 })}
             />
             <StatCard
-              label="可用" value={data!.available}
-              sub={`占比 ${summary.availableRate}%`}
+              label={t('stats.available')} value={data!.available}
+              sub={t('stats.ratio', { percent: summary.availableRate })}
               color="var(--color-ok)"
             />
             <StatCard
-              label="Basic 剩余" value={fmt(summary.totalRemaining)}
+              label={t('stats.basic_remaining')} value={fmt(summary.totalRemaining)}
               sub={summary.sameBasicQuota
-                ? 'Space / User 配额一致'
+                ? t('account.quota_unified')
                 : `Space ${fmt(summary.totalSpaceRemaining)} · User ${fmt(summary.totalUserRemaining)}`}
             />
             <StatCard
-              label="Premium 剩余" value={fmt(summary.totalPremiumBalance)}
+              label={t('stats.premium_remaining')} value={fmt(summary.totalPremiumBalance)}
               sub={summary.totalPremiumLimit > 0
-                ? `${summary.premiumAccounts} 个 premium 账号 · Research 用量 ${summary.totalResearchUsage}`
-                : `无 premium credits · Research 受限 ${summary.researchLimited}`}
+                ? t('stats.premium_accounts_count', { count: summary.premiumAccounts, usage: summary.totalResearchUsage })
+                : t('stats.no_premium_credits', { limit: summary.researchLimited })}
               color="var(--color-research, #9b51e0)"
             />
             <StatCard
               icon={<IconActivity />}
-              label="Token 用量"
+              label={t('stats.token_usage')}
               value={formatTokens(tokenStats?.total.total ?? 0)}
               sub={tokenStats
-                ? `今日 ${formatTokens(tokenStats.today.total)} · 输入 ${formatTokens(tokenStats.today.input)} · 输出 ${formatTokens(tokenStats.today.output)}`
-                : '尚未产生用量'}
+                ? t('stats.today_usage', { today: formatTokens(tokenStats.today.total), input: formatTokens(tokenStats.today.input), output: formatTokens(tokenStats.today.output) })
+                : t('stats.no_usage')}
               color="var(--color-notion-blue)"
             />
           </div>
@@ -859,7 +872,7 @@ export default function App() {
             <div className="w-4 h-4 border-2 border-notion-blue/30 border-t-notion-blue rounded-full animate-spin shrink-0" />
             <div className="flex-1 min-w-0">
               <div className="text-[13px] font-medium text-[#5c9ce6]">
-                正在刷新配额... {refreshStatus.done}/{refreshStatus.total}
+                {t('common.status_refreshing', { current: refreshStatus.done, total: refreshStatus.total })}
               </div>
               <div className="h-1.5 bg-white/[.06] rounded-full overflow-hidden mt-1.5">
                 <div
@@ -877,45 +890,45 @@ export default function App() {
             onClick={openBestProxy}
             className="inline-flex items-center gap-1.5 px-4 py-2 bg-white hover:bg-white/90 text-[#111] rounded-md text-[13px] font-medium cursor-pointer transition-colors border-none"
           >
-            <IconZap /> 打开最优账号
+            <IconZap /> {t('actions.open_best_account')}
           </button>
           <button
             onClick={handleQuotaRefresh}
             disabled={quotaRefreshing || refreshStatus?.refreshing}
             className={`inline-flex items-center gap-1.5 px-4 py-2 bg-bg-card hover:bg-bg-card-hover text-text-primary rounded-md text-[13px] font-medium cursor-pointer transition-colors border border-border disabled:opacity-50 disabled:cursor-not-allowed ${refreshStatus?.refreshing ? 'animate-pulse' : ''}`}
           >
-            <IconRefresh /> 刷新配额
+            <IconRefresh /> {t('actions.refresh_quota')}
           </button>
           <button
             onClick={refresh}
             disabled={refreshing}
             className={`inline-flex items-center gap-1.5 px-4 py-2 bg-bg-card hover:bg-bg-card-hover text-text-primary rounded-md text-[13px] font-medium cursor-pointer transition-colors border border-border disabled:opacity-50 disabled:cursor-not-allowed ${refreshing ? 'animate-pulse' : ''}`}
           >
-            <IconRefresh /> 刷新数据
+            <IconRefresh /> {t('actions.refresh_data')}
           </button>
           <button
             onClick={() => setShowAddModal(true)}
             className="inline-flex items-center gap-1.5 px-4 py-2 bg-bg-card hover:bg-bg-card-hover text-text-primary rounded-md text-[13px] font-medium cursor-pointer transition-colors border border-border"
           >
-            <IconPlus /> 添加账号
+            <IconPlus /> {t('actions.add_account')}
           </button>
           <button
             onClick={() => setRegisterOpen(true)}
             className="inline-flex items-center gap-1.5 px-4 py-2 bg-bg-card hover:bg-bg-card-hover text-text-primary rounded-md text-[13px] font-medium cursor-pointer transition-colors border border-border"
           >
-            <IconUserPlus size={13} /> 注册账号
+            <IconUserPlus size={13} /> {t('actions.register_account')}
           </button>
           <button
             onClick={() => setHistoryOpen(true)}
             className="inline-flex items-center gap-1.5 px-4 py-2 bg-bg-card hover:bg-bg-card-hover text-text-primary rounded-md text-[13px] font-medium cursor-pointer transition-colors border border-border"
           >
-            <IconHistory size={13} /> 历史任务
+            <IconHistory size={13} /> {t('actions.history_tasks')}
           </button>
           {refreshTime && (
             <span className="text-[11px] text-text-muted">
-              更新于 {refreshTime}
+              {t('actions.updated_at', { time: refreshTime })}
               {refreshStatus?.last_refresh_at && !refreshStatus.refreshing && (
-                <> · 配额刷新于 {new Date(refreshStatus.last_refresh_at).toLocaleTimeString('zh-CN')}</>
+                <> · {t('actions.quota_refreshed_at', { time: new Date(refreshStatus.last_refresh_at).toLocaleTimeString(dateLocale) })}</>
               )}
             </span>
           )}
@@ -930,7 +943,7 @@ export default function App() {
             <div className="mb-6 px-4 py-3 bg-[#171717] border border-white/5 rounded-lg shadow-inner">
               <div className="flex items-center gap-6 flex-wrap">
                 <span className="text-[12px] text-text-secondary font-medium flex items-center gap-2 shrink-0">
-                  <IconSettings /> API 设置
+                  <IconSettings /> {t('api.settings_title')}
                 </span>
                 <div className="flex items-center gap-6 flex-wrap">
                   <div className="flex items-center gap-1.5">
@@ -938,14 +951,14 @@ export default function App() {
                     <code
                       className={`text-[11px] bg-white/[.05] px-1.5 py-0.5 rounded cursor-pointer hover:bg-white/[.1] transition-colors font-mono ${copiedField === 'key' ? 'text-ok' : 'text-text-primary'}`}
                       onClick={() => copyToClipboard(apiKey, 'key')}
-                      title="点击复制"
+                      title={t('api.click_to_copy')}
                     >
-                      {copiedField === 'key' ? '✓ 已复制' : (apiKeyRevealed ? apiKey : maskedKey)}
+                      {copiedField === 'key' ? `✓ ${t('api.copied')}` : (apiKeyRevealed ? apiKey : maskedKey)}
                     </code>
                     <button
                       onClick={() => setApiKeyRevealed(!apiKeyRevealed)}
                       className="ml-3 text-text-muted hover:text-text-primary transition-colors bg-transparent border-none cursor-pointer px-0.5 flex items-center"
-                      title={apiKeyRevealed ? '隐藏' : '显示'}
+                      title={apiKeyRevealed ? t('api.hide') : t('api.show')}
                     >
                       {apiKeyRevealed ? (
                         <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
@@ -963,16 +976,16 @@ export default function App() {
                     <code
                       className={`text-[11px] bg-white/[.05] px-1.5 py-0.5 rounded cursor-pointer hover:bg-white/[.1] transition-colors font-mono ${copiedField === 'base' ? 'text-ok' : 'text-text-primary'}`}
                       onClick={() => copyToClipboard(apiBase, 'base')}
-                      title="点击复制"
+                      title={t('api.click_to_copy')}
                     >
-                      {copiedField === 'base' ? '✓ 已复制' : apiBase}
+                      {copiedField === 'base' ? `✓ ${t('api.copied')}` : apiBase}
                     </code>
                   </div>
                   <div className="flex items-center gap-1.5">
-                    <span className="text-[11px] text-text-muted">全局代理</span>
+                    <span className="text-[11px] text-text-muted">{t('api.global_proxy')}</span>
                     <span
                       className={`inline-block w-1.5 h-1.5 rounded-full ${proxyError ? 'bg-err' : settings.notion_proxy ? 'bg-ok' : 'bg-text-muted/60'}`}
-                      title={proxyError ? proxyError : settings.notion_proxy ? '已启用代理' : '直连'}
+                      title={proxyError ? proxyError : settings.notion_proxy ? t('api.proxy_enabled') : t('api.direct_connection')}
                     />
                     <input
                       type="text"
@@ -987,10 +1000,10 @@ export default function App() {
                           ;(e.target as HTMLInputElement).blur()
                         }
                       }}
-                      placeholder="留空 = 直连"
+                      placeholder={t('api.direct_connection_tip')}
                       disabled={proxySaving}
                       className={`text-[11px] bg-white/[.05] px-1.5 py-0.5 rounded font-mono outline-none border w-[160px] focus:w-[280px] transition-[width,border-color] duration-150 ${proxyError ? 'border-err text-err' : 'border-transparent focus:border-white/20 text-text-primary'} placeholder:text-text-muted/60`}
-                      title={proxyError || (settings.notion_proxy ? `当前: ${settings.notion_proxy}` : '当前: 直连')}
+                      title={proxyError || (settings.notion_proxy ? t('api.current_proxy', { proxy: settings.notion_proxy }) : t('api.current_direct'))}
                     />
                   </div>
                 </div>
@@ -1002,7 +1015,7 @@ export default function App() {
                     >
                       <span className={`absolute top-[2px] left-[2px] w-3 h-3 rounded-full transition-all duration-200 ${settings.enable_web_search ? 'bg-white shadow-sm translate-x-[12px]' : 'bg-white/40'}`} />
                     </button>
-                    <span className="text-[12px] text-white font-medium">联网搜索</span>
+                    <span className="text-[12px] text-white font-medium">{t('api.web_search')}</span>
                   </label>
                   <label className="flex items-center gap-2 cursor-pointer select-none">
                     <button
@@ -1011,7 +1024,7 @@ export default function App() {
                     >
                       <span className={`absolute top-[2px] left-[2px] w-3 h-3 rounded-full transition-all duration-200 ${settings.enable_workspace_search ? 'bg-white shadow-sm translate-x-[12px]' : 'bg-white/40'}`} />
                     </button>
-                    <span className="text-[12px] text-text-primary">工作区搜索</span>
+                    <span className="text-[12px] text-text-primary">{t('api.workspace_search')}</span>
                   </label>
                   <label
                     className="flex items-center gap-2 cursor-pointer select-none"
@@ -1023,7 +1036,7 @@ export default function App() {
                     >
                       <span className={`absolute top-[2px] left-[2px] w-3 h-3 rounded-full transition-all duration-200 ${settings.ask_mode_default ? 'bg-white shadow-sm translate-x-[12px]' : 'bg-white/40'}`} />
                     </button>
-                    <span className="text-[12px] text-text-primary">ASK 模式</span>
+                    <span className="text-[12px] text-text-primary">{t('api.ask_mode')}</span>
                   </label>
                   <label className="flex items-center gap-2 cursor-pointer select-none">
                     <button
@@ -1032,7 +1045,7 @@ export default function App() {
                     >
                       <span className={`absolute top-[2px] left-[2px] w-3 h-3 rounded-full transition-all duration-200 ${settings.debug_logging ? 'bg-white shadow-sm translate-x-[12px]' : 'bg-white/40'}`} />
                     </button>
-                    <span className="text-[12px] text-text-primary">调试日志</span>
+                    <span className="text-[12px] text-text-primary">{t('api.debug_log')}</span>
                   </label>
                 </div>
               </div>
@@ -1042,14 +1055,14 @@ export default function App() {
 
         {/* Section Title */}
         <div className="text-[12px] font-semibold text-text-secondary uppercase tracking-wider mb-3.5 flex items-center gap-1.5">
-          <span>账号池</span>
+          <span>{t('common.accounts_pool')}</span>
           <span className="font-normal text-text-muted">({filteredTotal})</span>
         </div>
 
         {/* Grid */}
         {filteredTotal === 0 ? (
           <div className="text-center py-16 text-text-secondary text-sm">
-            没有找到匹配的账号
+            {t('common.no_matching_accounts')}
           </div>
         ) : (
           <div className="grid grid-cols-[repeat(auto-fill,minmax(340px,1fr))] gap-2.5 mb-4">
@@ -1074,7 +1087,7 @@ export default function App() {
               disabled={page === 0}
               className="px-2.5 py-1.5 bg-bg-card hover:bg-bg-card-hover text-text-secondary rounded-md text-[12px] cursor-pointer transition-colors border border-border disabled:opacity-30 disabled:cursor-not-allowed"
             >
-              ‹ 上一页
+              ‹ {t('common.prev_page')}
             </button>
             <span className="text-[12px] text-text-secondary tabular-nums px-3">
               {page + 1} / {totalPages}
@@ -1084,7 +1097,7 @@ export default function App() {
               disabled={page >= totalPages - 1}
               className="px-2.5 py-1.5 bg-bg-card hover:bg-bg-card-hover text-text-secondary rounded-md text-[12px] cursor-pointer transition-colors border border-border disabled:opacity-30 disabled:cursor-not-allowed"
             >
-              下一页 ›
+              {t('common.next_page')} ›
             </button>
             <button
               onClick={() => setPage(totalPages - 1)}

@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
+import { useTranslation } from 'react-i18next'
 import type { AccountInfo } from '../types'
 import { deleteAccount, openProxy } from '../api'
 import { IconCopy, IconExternalLink, IconMore, IconTrash } from './Icons'
@@ -12,6 +13,7 @@ interface Props {
 // trigger so clicking it doesn't bubble up to the card's "open proxy"
 // click handler.
 export function AccountMenu({ account, onChanged }: Props) {
+  const { t } = useTranslation()
   const [open, setOpen] = useState(false)
   const [copied, setCopied] = useState(false)
   const [deleting, setDeleting] = useState(false)
@@ -85,7 +87,7 @@ export function AccountMenu({ account, onChanged }: Props) {
           setOpen((v) => !v)
         }}
         className="w-6 h-6 rounded hover:bg-white/[.08] text-text-secondary hover:text-text-primary flex items-center justify-center bg-transparent border-none cursor-pointer transition-colors"
-        title="更多操作"
+        title={t('menu.more_actions')}
       >
         <IconMore size={14} />
       </button>
@@ -98,16 +100,16 @@ export function AccountMenu({ account, onChanged }: Props) {
             onClick={onCopyToken}
             disabled={!account.token_v2}
             icon={<IconCopy size={13} />}
-            label={copied ? '已复制' : '复制 token_v2'}
+            label={copied ? t('menu.copied') : t('menu.copy_token')}
           />
-          <MenuItem onClick={onOpenProxy} icon={<IconExternalLink size={13} />} label="打开代理" />
+          <MenuItem onClick={onOpenProxy} icon={<IconExternalLink size={13} />} label={t('menu.open_proxy')} />
           <div className="border-t border-border my-1" />
           <MenuItem
             onClick={onDelete}
             danger
             disabled={deleting}
             icon={<IconTrash size={13} />}
-            label={confirming ? '确认删除？' : '删除账号'}
+            label={confirming ? t('menu.confirm_delete') : t('menu.delete_account')}
           />
         </div>
       )}
