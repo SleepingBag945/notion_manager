@@ -456,7 +456,10 @@ function AccountCard({ account, onChanged }: { account: AccountInfo; onChanged: 
   const premium = hasPremiumAccess(account)
   const researchLimited = isResearchLimited(account)
   const noWorkspace = !!account.no_workspace
-  const status = account.permanent || account.exhausted || noWorkspace
+  // Availability is determined by backend eligible/exhausted flags,
+  // NOT by usage > limit or remaining === 0.
+  const isAvailable = account.eligible === true && !account.exhausted && !account.permanent && !noWorkspace
+  const status = !isAvailable
     ? 'exhausted'
     : mergeQuotaStatus([
       getQuotaStatusByUsage(spaceQuota.usage, spaceQuota.limit),
@@ -464,7 +467,7 @@ function AccountCard({ account, onChanged }: { account: AccountInfo; onChanged: 
     ])
   const modelCount = account.models?.length || 0
 
-  const dotCls = status === 'exhausted' ? 'bg-err' : status === 'low' ? 'bg-err' : 'bg-ok'
+  const dotCls = !isAvailable ? 'bg-err' : status === 'low' ? 'bg-warn' : 'bg-ok'
   // no_workspace shares the exhausted card style so the operator
   // immediately sees the account is unhealthy. Click-through is blocked
   // because Notion's /ai SPA hangs indefinitely on these accounts (the
@@ -480,7 +483,7 @@ function AccountCard({ account, onChanged }: { account: AccountInfo; onChanged: 
       alert(t('account.no_workspace_alert'))
       return
     }
-    openProxy(account.email)
+    openProxy(account.account_id)
   }
 
   return (
@@ -1067,7 +1070,7 @@ export default function App() {
         ) : (
           <div className="grid grid-cols-[repeat(auto-fill,minmax(340px,1fr))] gap-2.5 mb-4">
             {paged.map(acc => (
-              <AccountCard key={acc.email} account={acc} onChanged={loadData} />
+              <AccountCard key={acc.account_id} account={acc} onChanged={loadData} />
             ))}
           </div>
         )}

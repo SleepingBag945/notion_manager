@@ -16,6 +16,7 @@ type Account struct {
 	UserEmail     string       `json:"user_email"`
 	SpaceID       string       `json:"space_id"`
 	SpaceName     string       `json:"space_name"`
+	AccountID     string       `json:"account_id,omitempty"` // SHA-256(user_id + "\0" + space_id)
 	SpaceViewID   string       `json:"space_view_id"`
 	PlanType      string       `json:"plan_type"`
 	Timezone      string       `json:"timezone"`

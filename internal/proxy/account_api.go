@@ -13,6 +13,39 @@ import (
 	"time"
 )
 
+// AccountDTO is the safe admin/dashboard representation.
+// Never contains token_v2, cookies, or authorization headers.
+type AccountDTO struct {
+	AccountID    string     `json:"account_id"`
+	UserEmail    string     `json:"user_email"`
+	UserName     string     `json:"user_name"`
+	SpaceName    string     `json:"space_name"`
+	SpaceIDShort string     `json:"space_id_short"`
+	PlanType     string     `json:"plan_type"`
+	QuotaInfo    *QuotaInfo `json:"quota_info,omitempty"`
+	IsExhausted  bool       `json:"is_exhausted"`
+	IsPermanent  bool       `json:"is_permanently_exhausted"`
+	SpaceCount   int        `json:"space_count"`
+}
+
+// NewAccountDTO builds a safe DTO from an Account (no secrets).
+func NewAccountDTO(acc *Account) AccountDTO {
+	acc.EnsureAccountID()
+	quota := acc.quotaSnapshot()
+	return AccountDTO{
+		AccountID:    acc.AccountID,
+		UserEmail:    acc.UserEmail,
+		UserName:     acc.UserName,
+		SpaceName:    acc.SpaceName,
+		SpaceIDShort: acc.ShortSpaceID(),
+		PlanType:     acc.PlanType,
+		QuotaInfo:    quota.Info,
+		IsExhausted:  quota.ExhaustedAt != nil,
+		IsPermanent:  quota.PermanentlyExhausted,
+		SpaceCount:   acc.SpaceCount,
+	}
+}
+
 // DiscoverAccountFromToken calls Notion APIs using the given token_v2 to discover
 // all account information (user, space, models, quota).
 func DiscoverAccountFromToken(tokenV2 string) (*Account, error) {
@@ -209,6 +242,8 @@ func DiscoverAccountFromToken(tokenV2 string) (*Account, error) {
 		DeviceID:      deviceID,
 	}
 
+	acc.EnsureAccountID()
+
 	// Step 2: Fetch available models
 	models, err := FetchModels(acc)
 	if err != nil {
@@ -230,14 +265,58 @@ func DiscoverAccountFromToken(tokenV2 string) (*Account, error) {
 }
 
 // SaveAccountToFile writes an Account to a JSON file in the accounts directory.
+// The filename uses the full account_id for collision safety:
+//
+//	<account_id>__<sanitized_email>.json
+//
+// If a file with the same account_id already exists (possibly under an old
+// naming scheme), it is overwritten at the same path. This prevents
+// duplicate files after migration.
+// findFileByAccountIDOnDisk scans dir for a JSON file whose "account_id" field
+// (or computed account_id from user_id+space_id) matches the given accountID.
+// Returns the full path if found, or "" if no match exists.
+func findFileByAccountIDOnDisk(dir, accountID string) string {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return ""
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
+			continue
+		}
+		path := filepath.Join(dir, entry.Name())
+		data, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		var m map[string]interface{}
+		if err := json.Unmarshal(data, &m); err != nil {
+			continue
+		}
+		aid, _ := m["account_id"].(string)
+		if aid == "" {
+			uid, _ := m["user_id"].(string)
+			sid, _ := m["space_id"].(string)
+			if uid != "" && sid != "" {
+				aid = ComputeAccountID(uid, sid)
+			}
+		}
+		if aid == accountID {
+			return path
+		}
+	}
+	return ""
+}
+
 func SaveAccountToFile(acc *Account, dir string) (string, error) {
-	// Generate a safe filename from the email or username
+	acc.EnsureAccountID()
+
 	name := acc.UserEmail
 	if name == "" {
 		name = acc.UserName
 	}
 	if name == "" {
-		name = acc.UserID
+		name = "unknown"
 	}
 	// Sanitize filename
 	name = strings.Map(func(r rune) rune {
@@ -247,11 +326,22 @@ func SaveAccountToFile(acc *Account, dir string) (string, error) {
 		return '_'
 	}, name)
 
-	filename := name + ".json"
+	newFilename := acc.AccountID + "__" + name + ".json"
+
+	// Check if an existing file already has this account_id (could be old
+	// naming scheme like "<aid[:12]>_email.json"). If found, reuse that path
+	// to avoid duplicates; otherwise use the new canonical name.
+	filename := newFilename
+	existingPath := findFileByAccountIDOnDisk(dir, acc.AccountID)
+	if existingPath != "" {
+		filename = filepath.Base(existingPath)
+	}
 	path := filepath.Join(dir, filename)
 
 	// Build the JSON structure
+	acc.EnsureAccountID()
 	data := map[string]interface{}{
+		"account_id":     acc.AccountID,
 		"token_v2":       acc.TokenV2,
 		"user_id":        acc.UserID,
 		"user_name":      acc.UserName,
@@ -315,12 +405,14 @@ func SaveAccountToFile(acc *Account, dir string) (string, error) {
 func (p *AccountPool) AddAccount(acc *Account) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	// Check for duplicate by email
+	// Check for duplicate by account_id (same user_id + space_id)
+	acc.EnsureAccountID()
 	for i, existing := range p.accounts {
-		if existing.UserEmail == acc.UserEmail {
-			// Replace existing
+		existing.EnsureAccountID()
+		if existing.AccountID != "" && existing.AccountID == acc.AccountID {
+			// Replace existing (same workspace)
 			p.accounts[i] = acc
-			log.Printf("[account] replaced: %s (%s)", acc.UserName, acc.UserEmail)
+			log.Printf("[account] replaced: %s (%s) aid=%s", acc.UserName, acc.UserEmail, acc.ShortSpaceID())
 			return
 		}
 	}
@@ -329,7 +421,8 @@ func (p *AccountPool) AddAccount(acc *Account) {
 }
 
 // DeleteAccountFile removes the JSON file for an account from the accounts directory.
-func DeleteAccountFile(email, dir string) error {
+// Matches by account_id first; falls back to user_id+space_id.
+func DeleteAccountFile(accountID, dir string) error {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return fmt.Errorf("read accounts dir: %w", err)
@@ -347,7 +440,16 @@ func DeleteAccountFile(email, dir string) error {
 		if err := json.Unmarshal(data, &existing); err != nil {
 			continue
 		}
-		if e, _ := existing["user_email"].(string); e == email {
+		exAID, _ := existing["account_id"].(string)
+		if exAID == "" {
+			// Legacy file: compute from user_id+space_id
+			exUID, _ := existing["user_id"].(string)
+			exSID, _ := existing["space_id"].(string)
+			if exUID != "" && exSID != "" {
+				exAID = ComputeAccountID(exUID, exSID)
+			}
+		}
+		if exAID == accountID {
 			if err := os.Remove(path); err != nil {
 				return fmt.Errorf("delete file %s: %w", entry.Name(), err)
 			}
@@ -355,7 +457,46 @@ func DeleteAccountFile(email, dir string) error {
 			return nil
 		}
 	}
-	return fmt.Errorf("account file not found for %s", email)
+	return fmt.Errorf("account file not found for account_id %s", accountID)
+}
+
+// DeleteAccountFileByEmail removes the JSON file by email (legacy).
+// Returns AmbiguousEmailError if multiple files match.
+func DeleteAccountFileByEmail(email, dir string) error {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return fmt.Errorf("read accounts dir: %w", err)
+	}
+	var matches []string
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
+			continue
+		}
+		path := filepath.Join(dir, entry.Name())
+		data, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		var existing map[string]interface{}
+		if err := json.Unmarshal(data, &existing); err != nil {
+			continue
+		}
+		if e, _ := existing["user_email"].(string); strings.EqualFold(e, email) {
+			matches = append(matches, path)
+		}
+	}
+	switch len(matches) {
+	case 0:
+		return fmt.Errorf("account file not found for %s", email)
+	case 1:
+		if err := os.Remove(matches[0]); err != nil {
+			return fmt.Errorf("delete file: %w", err)
+		}
+		log.Printf("[account] deleted file: %s", filepath.Base(matches[0]))
+		return nil
+	default:
+		return &AmbiguousEmailError{Email: email, Count: len(matches)}
+	}
 }
 
 // HandleAddAccount accepts a token_v2, discovers account info via Notion APIs,
@@ -459,20 +600,30 @@ func HandleDeleteAccount(pool *AccountPool, accountsDir string, auth *DashboardA
 			return
 		}
 
-		// Remove from pool
-		if !pool.RemoveAccountByEmail(email) {
+		// Remove from pool and get account_id for file deletion
+		acc := pool.GetByEmail(email)
+		if acc == nil {
 			w.WriteHeader(http.StatusNotFound)
 			json.NewEncoder(w).Encode(map[string]string{"error": "account not found in pool"})
 			return
 		}
+		acc.EnsureAccountID()
+		accountID := acc.AccountID
+		pool.RemoveAccountByEmail(email)
 
-		// Delete file
-		if err := DeleteAccountFile(email, accountsDir); err != nil {
-			log.Printf("[delete-account] file deletion warning: %v", err)
-			// Account removed from pool but file not deleted — not fatal
+		// Delete file by account_id
+		if accountID != "" {
+			if err := DeleteAccountFile(accountID, accountsDir); err != nil {
+				log.Printf("[delete-account] file deletion warning: %v", err)
+			}
+		} else {
+			// Legacy fallback: no account_id available
+			if err := DeleteAccountFileByEmail(email, accountsDir); err != nil {
+				log.Printf("[delete-account] file deletion warning (by email): %v", err)
+			}
 		}
 
-		log.Printf("[delete-account] removed: %s", email)
+		log.Printf("[delete-account] removed: %s (account_id=%s)", email, accountID)
 		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 	}
 }

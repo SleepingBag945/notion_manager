@@ -62,14 +62,14 @@ func TestFilterAccountDetailsMatchesEmailNamePlanSpace(t *testing.T) {
 		query string
 		want  []string
 	}{
-		{"alice", []string{"Alice"}},                // name match
-		{"BOB@", []string{"Bob"}},                   // email, case-insensitive
-		{"plus", []string{"Alice"}},                 // plan match
-		{"gamma", []string{"Carol"}},                // space match
-		{"example", []string{"Bob", "Carol"}},       // multiple matches preserve order
-		{"  ", []string{"Alice", "Bob", "Carol"}},   // whitespace == no filter
-		{"", []string{"Alice", "Bob", "Carol"}},     // empty == no filter
-		{"missing", nil},                            // zero match
+		{"alice", []string{"Alice"}},              // name match
+		{"BOB@", []string{"Bob"}},                 // email, case-insensitive
+		{"plus", []string{"Alice"}},               // plan match
+		{"gamma", []string{"Carol"}},              // space match
+		{"example", []string{"Bob", "Carol"}},     // multiple matches preserve order
+		{"  ", []string{"Alice", "Bob", "Carol"}}, // whitespace == no filter
+		{"", []string{"Alice", "Bob", "Carol"}},   // empty == no filter
+		{"missing", nil},                          // zero match
 	}
 	for _, tc := range cases {
 		t.Run(tc.query, func(t *testing.T) {
