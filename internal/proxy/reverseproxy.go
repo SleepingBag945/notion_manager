@@ -36,8 +36,8 @@ type ProxySession struct {
 // ReverseProxy proxies requests to notion.so with session/cookie injection
 type ReverseProxy struct {
 	pool      *AccountPool
-	sessions  sync.Map        // sessionID → *ProxySession
-	msgClient *http.Client    // shared client for msgstore (connection reuse required)
+	sessions  sync.Map     // sessionID → *ProxySession
+	msgClient *http.Client // shared client for msgstore (connection reuse required)
 }
 
 // NewReverseProxy creates a reverse proxy backed by the given account pool

@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import type { AccountInfo } from '../types'
 import { deleteAccount, openProxy } from '../api'
-import { IconCopy, IconExternalLink, IconMore, IconTrash } from './Icons'
+import { IconExternalLink, IconMore, IconTrash } from './Icons'
 
 interface Props {
   account: AccountInfo
@@ -15,7 +15,6 @@ interface Props {
 export function AccountMenu({ account, onChanged }: Props) {
   const { t } = useTranslation()
   const [open, setOpen] = useState(false)
-  const [copied, setCopied] = useState(false)
   const [deleting, setDeleting] = useState(false)
   const [confirming, setConfirming] = useState(false)
   const wrapRef = useRef<HTMLDivElement>(null)
@@ -42,21 +41,9 @@ export function AccountMenu({ account, onChanged }: Props) {
     }
   }, [open])
 
-  const onCopyToken = async (e: React.MouseEvent) => {
-    e.stopPropagation()
-    if (!account.token_v2) return
-    try {
-      await navigator.clipboard.writeText(account.token_v2)
-      setCopied(true)
-      setTimeout(() => setCopied(false), 1200)
-    } catch {
-      // best effort
-    }
-  }
-
   const onOpenProxy = (e: React.MouseEvent) => {
     e.stopPropagation()
-    openProxy(account.email)
+    openProxy(account.account_id)
     setOpen(false)
   }
 
@@ -68,7 +55,7 @@ export function AccountMenu({ account, onChanged }: Props) {
     }
     setDeleting(true)
     try {
-      await deleteAccount(account.email)
+      await deleteAccount(account.account_id)
       onChanged()
     } catch (err) {
       console.error('delete account failed', err)
@@ -96,12 +83,6 @@ export function AccountMenu({ account, onChanged }: Props) {
           className="absolute right-0 top-7 z-30 w-44 bg-bg-secondary border border-border rounded-md shadow-xl shadow-black/40 py-1"
           onClick={(e) => e.stopPropagation()}
         >
-          <MenuItem
-            onClick={onCopyToken}
-            disabled={!account.token_v2}
-            icon={<IconCopy size={13} />}
-            label={copied ? t('menu.copied') : t('menu.copy_token')}
-          />
           <MenuItem onClick={onOpenProxy} icon={<IconExternalLink size={13} />} label={t('menu.open_proxy')} />
           <div className="border-t border-border my-1" />
           <MenuItem

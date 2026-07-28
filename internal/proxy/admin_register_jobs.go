@@ -219,18 +219,18 @@ func HandleAdminRegisterStart(deps *RegisterJobsDeps) http.HandlerFunc {
 		// Detach from the request context so cancelled HTTP clients don't
 		// kill the background run.
 		runCtx := context.Background()
-	go regjob.Run(runCtx, deps.Store, job.ID, prov, creds, regjob.RunOpts{
-		Concurrency: concurrency,
-		AccountsDir: deps.AccountsDir,
-		Proxy:       proxyURL,
-		OnSuccess: func(email string) {
-			deps.Pool.ReloadFromDir(deps.AccountsDir)
-			triggerPostRegisterRefresh(deps, email)
-		},
-	})
+		go regjob.Run(runCtx, deps.Store, job.ID, prov, creds, regjob.RunOpts{
+			Concurrency: concurrency,
+			AccountsDir: deps.AccountsDir,
+			Proxy:       proxyURL,
+			OnSuccess: func(email string) {
+				deps.Pool.ReloadFromDir(deps.AccountsDir)
+				triggerPostRegisterRefresh(deps, email)
+			},
+		})
 
-	resp := map[string]interface{}{
-		"job_id":      job.ID,
+		resp := map[string]interface{}{
+			"job_id":      job.ID,
 			"provider":    prov.ID(),
 			"total":       len(creds),
 			"concurrency": concurrency,
@@ -585,7 +585,9 @@ func writeSSE(w http.ResponseWriter, event string, payload interface{}) error {
 // HandleAdminDeleteAccount removes one account JSON file from disk and from
 // the live AccountPool. Path:
 //
-//	DELETE /admin/accounts/{email}
+//	DELETE /admin/accounts/{identifier}
+//
+// The identifier is either an account_id (64-char hex) or an email (legacy).
 func HandleAdminDeleteAccount(deps *RegisterJobsDeps) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -598,21 +600,35 @@ func HandleAdminDeleteAccount(deps *RegisterJobsDeps) http.HandlerFunc {
 		}
 		raw := strings.TrimPrefix(r.URL.Path, "/admin/accounts/")
 		raw = strings.Trim(raw, "/")
-		email, err := url.PathUnescape(raw)
-		if err != nil || email == "" {
-			http.Error(w, `{"error":"missing email"}`, http.StatusBadRequest)
+		identifier, err := url.PathUnescape(raw)
+		if err != nil || identifier == "" {
+			http.Error(w, `{"error":"missing identifier"}`, http.StatusBadRequest)
 			return
 		}
 
-		if err := deleteAccountByEmail(deps.Pool, deps.AccountsDir, email); err != nil {
-			if os.IsNotExist(err) {
-				http.Error(w, `{"error":"account not found"}`, http.StatusNotFound)
+		// If identifier looks like a 64-char hex account_id, delete by that;
+		// otherwise fall back to email for backward compatibility.
+		if isAccountID(identifier) {
+			if err := deleteAccountByID(deps.Pool, deps.AccountsDir, identifier); err != nil {
+				if os.IsNotExist(err) {
+					http.Error(w, `{"error":"account not found"}`, http.StatusNotFound)
+					return
+				}
+				http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err), http.StatusInternalServerError)
 				return
 			}
-			http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err), http.StatusInternalServerError)
-			return
+			_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok", "deleted": identifier})
+		} else {
+			if err := deleteAccountByEmail(deps.Pool, deps.AccountsDir, identifier); err != nil {
+				if os.IsNotExist(err) {
+					http.Error(w, `{"error":"account not found"}`, http.StatusNotFound)
+					return
+				}
+				http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err), http.StatusInternalServerError)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok", "deleted": identifier})
 		}
-		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok", "deleted": email})
 	}
 }
 
@@ -653,5 +669,65 @@ func deleteAccountByEmail(pool *AccountPool, dir, email string) error {
 		pool.RemoveAccountByEmail(email)
 	}
 	log.Printf("[admin] deleted account file: %s (%s)", target, email)
+	return nil
+}
+
+// isAccountID returns true if s looks like a 64-char lowercase hex account_id.
+func isAccountID(s string) bool {
+	if len(s) != 64 {
+		return false
+	}
+	for _, c := range s {
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+			return false
+		}
+	}
+	return true
+}
+
+// deleteAccountByID removes the account JSON file whose account_id field
+// matches (or can be computed from user_id+space_id) and drops the pool entry.
+func deleteAccountByID(pool *AccountPool, dir, accountID string) error {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return err
+	}
+	var target string
+	for _, e := range entries {
+		if e.IsDir() || filepath.Ext(e.Name()) != ".json" {
+			continue
+		}
+		path := filepath.Join(dir, e.Name())
+		data, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		var raw map[string]interface{}
+		if err := json.Unmarshal(data, &raw); err != nil {
+			continue
+		}
+		aid, _ := raw["account_id"].(string)
+		if aid == "" {
+			uid, _ := raw["user_id"].(string)
+			sid, _ := raw["space_id"].(string)
+			if uid != "" && sid != "" {
+				aid = ComputeAccountID(uid, sid)
+			}
+		}
+		if aid == accountID {
+			target = path
+			break
+		}
+	}
+	if target == "" {
+		return os.ErrNotExist
+	}
+	if err := os.Remove(target); err != nil {
+		return err
+	}
+	if pool != nil {
+		pool.RemoveAccountByAccountID(accountID)
+	}
+	log.Printf("[admin] deleted account file by account_id: %s", target)
 	return nil
 }

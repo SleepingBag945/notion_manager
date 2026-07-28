@@ -287,11 +287,14 @@ func HandleProxyStart(pool *AccountPool, rp *ReverseProxy, auth *DashboardAuth) 
 		}
 
 		email := r.URL.Query().Get("email")
+		accountID := r.URL.Query().Get("account_id")
 		best := r.URL.Query().Get("best")
 
 		var acc *Account
 		if best == "true" {
 			acc = pool.GetBestAccount()
+		} else if accountID != "" {
+			acc = pool.FindByAccountID(accountID)
 		} else if email != "" {
 			acc = pool.GetAccountByEmail(email)
 		}

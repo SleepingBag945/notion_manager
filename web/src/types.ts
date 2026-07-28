@@ -4,10 +4,12 @@ export interface Model {
 }
 
 export interface AccountInfo {
+  account_id: string
   email: string
   name: string
   plan: string
   space: string
+  space_id_short?: string
   exhausted: boolean
   permanent: boolean
   // no_workspace is true when the backend probed loadUserContent and found

@@ -494,9 +494,9 @@ func (t *openAIResponsesStreamTranscoder) ensureMessageItem() error {
 		return err
 	}
 	return t.emit("response.content_part.added", map[string]interface{}{
-		"response_id":  t.responseID,
-		"item_id":      t.messageItemID,
-		"output_index": t.messageIndex,
+		"response_id":   t.responseID,
+		"item_id":       t.messageItemID,
+		"output_index":  t.messageIndex,
 		"content_index": 0,
 		"part": map[string]interface{}{
 			"type":        "output_text",

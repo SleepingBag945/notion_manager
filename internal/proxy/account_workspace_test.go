@@ -130,7 +130,7 @@ func TestRefreshAndPersistAccountSavesWorkspace(t *testing.T) {
 	path := seedAccountFile(t, dir, email)
 
 	pool := NewAccountPool()
-	pool.accounts = []*Account{{UserEmail: email, SpaceID: "s", UserID: "u-" + email}}
+	pool.accounts = []*Account{{UserEmail: email, SpaceID: "s-" + email, UserID: "u-" + email}}
 
 	restoreFetch := withFetchers(t,
 		func(*Account) (*QuotaInfo, error) {
@@ -176,7 +176,7 @@ func TestRefreshAndPersistAccountSurvivesProbeError(t *testing.T) {
 	path := seedAccountFile(t, dir, email)
 
 	pool := NewAccountPool()
-	pool.accounts = []*Account{{UserEmail: email, SpaceID: "s"}}
+	pool.accounts = []*Account{{UserEmail: email, UserID: "u-" + email, SpaceID: "s-" + email}}
 
 	restoreFetch := withFetchers(t,
 		func(*Account) (*QuotaInfo, error) {

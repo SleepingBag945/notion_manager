@@ -205,8 +205,8 @@ export async function fetchTokenStats(): Promise<TokenStats> {
   return resp.json()
 }
 
-export function openProxy(email: string) {
-  window.open(`/proxy/start?email=${encodeURIComponent(email)}`, '_blank')
+export function openProxy(accountId: string) {
+  window.open(`/proxy/start?account_id=${encodeURIComponent(accountId)}`, '_blank')
 }
 
 export function openBestProxy() {
@@ -360,8 +360,8 @@ export async function getJob(id: string): Promise<RegisterJob> {
   return jsonOrError(resp) as Promise<RegisterJob>
 }
 
-export async function deleteAccount(email: string): Promise<void> {
-  const resp = await fetch(`/admin/accounts/${encodeURIComponent(email)}`, {
+export async function deleteAccount(accountId: string): Promise<void> {
+  const resp = await fetch(`/admin/accounts/${encodeURIComponent(accountId)}`, {
     method: 'DELETE',
     credentials: 'same-origin',
   })
