@@ -189,7 +189,7 @@ func HandleAdminAccounts(pool *AccountPool, auth *DashboardAuth) http.HandlerFun
 }
 
 // HandleAdminStats returns aggregated Token usage statistics for the
-// dashboard. It only requires a valid dashboard session — same auth
+// dashboard. It only requires a valid dashboard session - same auth
 // surface as /admin/accounts. The response shape is documented on
 // UsageSnapshot.
 func HandleAdminStats(stats *UsageStats, auth *DashboardAuth) http.HandlerFunc {
@@ -204,6 +204,26 @@ func HandleAdminStats(stats *UsageStats, auth *DashboardAuth) http.HandlerFunc {
 		}
 		snap := stats.Snapshot(5)
 		json.NewEncoder(w).Encode(snap)
+	}
+}
+
+// HandleAdminRequestLogs returns recent individual request logs (ring buffer,
+// newest first). In-memory only, not persisted across restarts.
+func HandleAdminRequestLogs(stats *UsageStats, auth *DashboardAuth) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if auth.HasAdminPassword() && !auth.ValidateSession(r) {
+			http.Error(w, `{"error":"unauthorized, dashboard login required"}`, http.StatusUnauthorized)
+			return
+		}
+		if stats == nil {
+			stats = GlobalUsageStats()
+		}
+		logs := stats.GetRequestLogs()
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"logs":  logs,
+			"total": len(logs),
+		})
 	}
 }
 
@@ -230,6 +250,43 @@ func HandleAdminRefresh(pool *AccountPool, accountsDir string, auth *DashboardAu
 		default:
 			http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
 		}
+	}
+}
+
+// HandleAdminToggleAccount enables or disables an account by email.
+// The disabled flag persists to the account JSON file and causes the
+// pool to skip the account for all request routing.
+func HandleAdminToggleAccount(pool *AccountPool, accountsDir string, auth *DashboardAuth) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if auth.HasAdminPassword() && !auth.ValidateSession(r) {
+			http.Error(w, `{"error":"unauthorized, dashboard login required"}`, http.StatusUnauthorized)
+			return
+		}
+		if r.Method != http.MethodPost {
+			http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+			return
+		}
+		var body struct {
+			Email    string `json:"email"`
+			Disabled bool   `json:"disabled"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, `{"error":"invalid request body"}`, http.StatusBadRequest)
+			return
+		}
+		if strings.TrimSpace(body.Email) == "" {
+			http.Error(w, `{"error":"email is required"}`, http.StatusBadRequest)
+			return
+		}
+		if err := pool.ToggleDisabled(body.Email, body.Disabled, accountsDir); err != nil {
+			http.Error(w, `{"error":"`+err.Error()+`"}`, http.StatusNotFound)
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"email":    body.Email,
+			"disabled": body.Disabled,
+		})
 	}
 }
 
@@ -267,6 +324,7 @@ func HandleAdminSettings(configPath string, auth *DashboardAuth) http.HandlerFun
 				"enable_web_search":       AppConfig.WebSearchEnabled(),
 				"enable_workspace_search": AppConfig.WorkspaceSearchEnabled(),
 				"ask_mode_default":        AppConfig.AskModeDefault(),
+				"max_concurrency":         AppConfig.MaxConcurrency(),
 				"disable_notion_prompt":   AppConfig.Proxy.DisableNotionPrompt,
 				"debug_logging":           AppConfig.Server.DebugLogging,
 				"notion_proxy":            AppConfig.NotionProxyURL(),
@@ -277,6 +335,7 @@ func HandleAdminSettings(configPath string, auth *DashboardAuth) http.HandlerFun
 				EnableWebSearch       *bool   `json:"enable_web_search"`
 				EnableWorkspaceSearch *bool   `json:"enable_workspace_search"`
 				AskModeDefault        *bool   `json:"ask_mode_default"`
+				MaxConcurrency        *int    `json:"max_concurrency"`
 				DebugLogging          *bool   `json:"debug_logging"`
 				NotionProxy           *string `json:"notion_proxy"`
 			}
@@ -301,6 +360,15 @@ func HandleAdminSettings(configPath string, auth *DashboardAuth) http.HandlerFun
 				AppConfig.Proxy.AskModeDefault = body.AskModeDefault
 				changed = true
 				log.Printf("[settings] ask_mode_default → %v", *body.AskModeDefault)
+			}
+			if body.MaxConcurrency != nil {
+				if *body.MaxConcurrency < 1 || *body.MaxConcurrency > 100 {
+					http.Error(w, `{"error":"max_concurrency must be between 1 and 100"}`, http.StatusBadRequest)
+					return
+				}
+				AppConfig.Proxy.MaxConcurrency = *body.MaxConcurrency
+				changed = true
+				log.Printf("[settings] max_concurrency → %d", *body.MaxConcurrency)
 			}
 			if body.DebugLogging != nil {
 				AppConfig.Server.DebugLogging = *body.DebugLogging
@@ -347,6 +415,7 @@ func HandleAdminSettings(configPath string, auth *DashboardAuth) http.HandlerFun
 				"enable_web_search":       AppConfig.WebSearchEnabled(),
 				"enable_workspace_search": AppConfig.WorkspaceSearchEnabled(),
 				"ask_mode_default":        AppConfig.AskModeDefault(),
+				"max_concurrency":         AppConfig.MaxConcurrency(),
 				"disable_notion_prompt":   AppConfig.Proxy.DisableNotionPrompt,
 				"debug_logging":           AppConfig.Server.DebugLogging,
 				"notion_proxy":            AppConfig.NotionProxyURL(),
@@ -377,6 +446,7 @@ func persistSearchSettings(configPath string) {
 		setYAMLBool(proxyNode, "enable_web_search", AppConfig.WebSearchEnabled())
 		setYAMLBool(proxyNode, "enable_workspace_search", AppConfig.WorkspaceSearchEnabled())
 		setYAMLBool(proxyNode, "ask_mode_default", AppConfig.AskModeDefault())
+		setYAMLInt(proxyNode, "max_concurrency", AppConfig.MaxConcurrency())
 		setYAMLString(proxyNode, "notion_proxy", AppConfig.Proxy.NotionProxy)
 
 		serverNode := getOrCreateYAMLMapping(mapping, "server")
@@ -431,6 +501,22 @@ func setYAMLBool(mapping *yaml.Node, key string, value bool) {
 	mapping.Content = append(mapping.Content,
 		&yaml.Node{Kind: yaml.ScalarNode, Value: key},
 		&yaml.Node{Kind: yaml.ScalarNode, Value: valStr, Tag: "!!bool"},
+	)
+}
+
+// setYAMLInt sets or creates an integer field in a YAML mapping node.
+func setYAMLInt(mapping *yaml.Node, key string, value int) {
+	valStr := strconv.Itoa(value)
+	for i := 0; i < len(mapping.Content)-1; i += 2 {
+		if mapping.Content[i].Value == key {
+			mapping.Content[i+1].Value = valStr
+			mapping.Content[i+1].Tag = "!!int"
+			return
+		}
+	}
+	mapping.Content = append(mapping.Content,
+		&yaml.Node{Kind: yaml.ScalarNode, Value: key},
+		&yaml.Node{Kind: yaml.ScalarNode, Value: valStr, Tag: "!!int"},
 	)
 }
 

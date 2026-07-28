@@ -293,7 +293,7 @@ func HandleProxyStart(pool *AccountPool, rp *ReverseProxy, auth *DashboardAuth) 
 		if best == "true" {
 			acc = pool.GetBestAccount()
 		} else if email != "" {
-			acc = pool.GetAccountByEmail(email)
+			acc = pool.GetByEmail(email)
 		}
 
 		if acc == nil {

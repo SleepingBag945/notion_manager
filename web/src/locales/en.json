@@ -24,7 +24,11 @@
     "recent_ai": "Recent AI {{date}}",
     "unavailable": "Unavailable ⚠",
     "open_proxy": "Open Proxy →",
-    "quota_unified": "Space / User Quotas match"
+    "quota_unified": "Space / User Quotas match",
+    "disabled": "Disabled",
+    "disabled_status": "Account disabled",
+    "disabled_alert": "This account is manually disabled. Enable it from the menu first.",
+    "disabled_tooltip": "Manually disabled and excluded from scheduling"
   },
   "stats": {
     "total_accounts": "Total Accounts",
@@ -39,7 +43,8 @@
     "today_usage": "Today {{today}} · Input {{input}} · Output {{output}}",
     "no_usage": "No usage yet",
     "basic_overview": "Basic Quota Overview",
-    "remaining": "Remaining"
+    "remaining": "Remaining",
+    "used_percent": "{{percent}}% used"
   },
   "actions": {
     "open_best_account": "Open Best Account",
@@ -49,7 +54,8 @@
     "register_account": "Register Account",
     "history_tasks": "History Tasks",
     "updated_at": "Updated at {{time}}",
-    "quota_refreshed_at": "Quota refreshed at {{time}}"
+    "quota_refreshed_at": "Quota refreshed at {{time}}",
+    "request_logs": "Request Logs"
   },
   "api": {
     "settings_title": "API Settings",
@@ -67,7 +73,11 @@
     "workspace_search": "Workspace Search",
     "ask_mode": "ASK Mode",
     "debug_log": "Debug Log",
-    "save_failed": "Save failed"
+    "save_failed": "Save failed",
+    "max_concurrency": "Per-account concurrency",
+    "max_concurrency_desc": "Simultaneous requests allowed for each account",
+    "max_concurrency_hint": "1–100",
+    "saving": "Saving"
   },
   "modal": {
     "add": {
@@ -151,7 +161,9 @@
     "copy_token": "Copy token_v2",
     "open_proxy": "Open Proxy",
     "confirm_delete": "Confirm delete?",
-    "delete_account": "Delete Account"
+    "delete_account": "Delete Account",
+    "disable_account": "Disable Account",
+    "enable_account": "Enable Account"
   },
   "common": {
     "cancel": "Cancel",
@@ -165,5 +177,27 @@
     "prev_page": "Previous",
     "next_page": "Next",
     "status_refreshing": "Refreshing quotas... {{current}}/{{total}}"
+  },
+  "quota_info": {
+    "open": "Quota Guide",
+    "title": "User / Workspace Quota Guide",
+    "intro": "The dashboard queries both Notion V2 and V1 quota endpoints. Valid V2 basicCredits take priority; V1 is the compatibility fallback.",
+    "space": "Space is the shared Basic usage and limit for the current workspace.",
+    "user": "User is the Basic usage and limit for the current user.",
+    "effective_basic": "The schedulable balance is the smaller of Space remaining and User remaining.",
+    "source": "Refresh Quota queries upstream again; the card timestamp is the latest successful check.",
+    "premium": "Premium is shown separately and does not increase Basic balance; Research has its own upstream limit.",
+    "percent": "Progress is usage divided by limit; a zero limit is displayed as 0%."
+  },
+  "request_logs": {
+    "title": "Request Logs",
+    "refresh": "Refresh",
+    "close": "Close",
+    "loading": "Loading...",
+    "empty": "No request records",
+    "load_failed": "Failed to load request logs",
+    "unknown_model": "Unknown model",
+    "account": "Account",
+    "tokens_detail": "Input {{prompt}} · Output {{completion}}"
   }
 }

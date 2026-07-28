@@ -47,6 +47,7 @@ type ProxyConfig struct {
 	NotionAPIBase         string `yaml:"notion_api_base"`
 	ClientVersion         string `yaml:"client_version"`
 	DefaultModel          string `yaml:"default_model"`
+	MaxConcurrency        int    `yaml:"max_concurrency"`
 	DisableNotionPrompt   bool   `yaml:"disable_notion_prompt"`
 	EnableWebSearch       *bool  `yaml:"enable_web_search"`
 	EnableWorkspaceSearch *bool  `yaml:"enable_workspace_search"`
@@ -127,6 +128,7 @@ func DefaultConfig() *Config {
 			NotionAPIBase:         "https://www.notion.so/api/v3",
 			ClientVersion:         "23.13.20260313.1423",
 			DefaultModel:          "opus-4.6",
+			MaxConcurrency:        1,
 			EnableWebSearch:       boolPtr(true),
 			EnableWorkspaceSearch: boolPtr(false),
 			AskModeDefault:        boolPtr(false),
@@ -234,6 +236,11 @@ func LoadConfig(configPath string) (*Config, error) {
 	}
 	if v := os.Getenv("DEFAULT_MODEL"); v != "" {
 		cfg.Proxy.DefaultModel = v
+	}
+	if v := os.Getenv("MAX_CONCURRENCY"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 1 && n <= 100 {
+			cfg.Proxy.MaxConcurrency = n
+		}
 	}
 	if v := os.Getenv("INFERENCE_TIMEOUT"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
@@ -595,6 +602,18 @@ func (c *Config) AskModeDefault() bool {
 		return false
 	}
 	return *c.Proxy.AskModeDefault
+}
+
+// MaxConcurrency returns the per-account request concurrency cap.
+// Missing/invalid config falls back to 1; the dashboard validates 1..100.
+func (c *Config) MaxConcurrency() int {
+	if c == nil || c.Proxy.MaxConcurrency <= 0 {
+		return 1
+	}
+	if c.Proxy.MaxConcurrency > 100 {
+		return 100
+	}
+	return c.Proxy.MaxConcurrency
 }
 
 // NotionProxyURL returns the upstream proxy applied to all notion-bound

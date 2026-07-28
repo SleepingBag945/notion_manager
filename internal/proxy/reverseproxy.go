@@ -36,8 +36,8 @@ type ProxySession struct {
 // ReverseProxy proxies requests to notion.so with session/cookie injection
 type ReverseProxy struct {
 	pool      *AccountPool
-	sessions  sync.Map        // sessionID → *ProxySession
-	msgClient *http.Client    // shared client for msgstore (connection reuse required)
+	sessions  sync.Map     // sessionID → *ProxySession
+	msgClient *http.Client // shared client for msgstore (connection reuse required)
 }
 
 // NewReverseProxy creates a reverse proxy backed by the given account pool
@@ -73,7 +73,12 @@ func NewReverseProxy(pool *AccountPool) *ReverseProxy {
 func (rp *ReverseProxy) getSession(r *http.Request) *ProxySession {
 	if c, err := r.Cookie("np_session"); err == nil {
 		if s, ok := rp.sessions.Load(c.Value); ok {
-			return s.(*ProxySession)
+			sess := s.(*ProxySession)
+			if !rp.pool.IsUsableAccount(sess.Account) {
+				rp.sessions.Delete(c.Value)
+				return nil
+			}
+			return sess
 		}
 	}
 	return nil

@@ -39,6 +39,12 @@ var ErrResearchQuotaExhausted = errors.New("research mode usage limit exceeded")
 // This typically means the account/thread is in a bad state and should be retried.
 var ErrEmptyResponse = errors.New("empty response from inference")
 
+// ErrAllAccountsBusy is returned when every otherwise-eligible account is at
+// its configured per-account concurrency limit. This is distinct from quota
+// exhaustion: callers should surface it as a retryable 429 and must not mark
+// busy accounts as exhausted.
+var ErrAllAccountsBusy = errors.New("all accounts busy")
+
 var (
 	NotionAPIBase        = "https://www.notion.so/api/v3"
 	DefaultClientVersion = "23.13.20260313.1423"
@@ -1715,9 +1721,51 @@ func setNotionHeadersJSON(req *http.Request, acc *Account) {
 	}
 }
 
+func buildQuotaInfoFromResponses(v1 quotaV1Response, v2 quotaV2Response) *QuotaInfo {
+	monthlyUsage := v2.PremiumCredits.PerSource.MonthlyAllocated.UsageTotal
+	monthlyLimit := v2.PremiumCredits.PerSource.MonthlyAllocated.Limit
+	premiumRemaining := v2.PremiumCredits.TotalCreditBalance
+	// Some workspaces report remaining premium via monthlyAllocated usage/limit,
+	// while totalCreditBalance can stay at 0.
+	if premiumRemaining <= 0 && monthlyLimit > monthlyUsage {
+		premiumRemaining = monthlyLimit - monthlyUsage
+	}
+
+	info := &QuotaInfo{
+		IsEligible:        v1.IsEligible,
+		SpaceUsage:        v1.SpaceUsage,
+		SpaceLimit:        v1.SpaceLimit,
+		UserUsage:         v1.UserUsage,
+		UserLimit:         v1.UserLimit,
+		LastUsageAtMs:     v1.LastSpaceUsageAtMs,
+		ResearchModeUsage: v1.ResearchModeUsage,
+		// Premium credits from V2
+		PremiumBalance: premiumRemaining,
+		PremiumUsage:   monthlyUsage,
+		PremiumLimit:   monthlyLimit,
+	}
+
+	// V2 basic credits are authoritative when Notion reports any usable
+	// basic limit there. When V2 has no basic limit data, keep V1's values.
+	if v2.BasicCredits.SpaceLimit > 0 || v2.BasicCredits.UserLimit > 0 {
+		info.SpaceUsage = v2.BasicCredits.SpaceUsage
+		info.SpaceLimit = v2.BasicCredits.SpaceLimit
+		info.UserUsage = v2.BasicCredits.UserUsage
+		info.UserLimit = v2.BasicCredits.UserLimit
+		info.LastUsageAtMs = v2.BasicCredits.LastSpaceUsageAtMs
+	}
+
+	info.HasPremium = info.PremiumLimit > 0 ||
+		v2.PremiumCredits.PerSource.MonthlyCommitted.Limit > 0 ||
+		v2.PremiumCredits.PerSource.YearlyElastic.Limit > 0 ||
+		info.PremiumBalance > 0
+
+	return info
+}
+
 // CheckQuota calls both V1 and V2 Notion quota APIs:
 //   - V1 (getAIUsageEligibility): isEligible, basic credits, researchModeUsage
-//   - V2 (getAIUsageEligibilityV2): premium credits (monthlyAllocated, etc.)
+//   - V2 (getAIUsageEligibilityV2): basic credits, premium credits (monthlyAllocated, etc.)
 func CheckQuota(acc *Account) (*QuotaInfo, error) {
 	body, _ := json.Marshal(map[string]string{"spaceId": acc.SpaceID})
 	client := getChromeHTTPClient(AppConfig.APITimeoutDuration())
@@ -1765,35 +1813,7 @@ func CheckQuota(acc *Account) (*QuotaInfo, error) {
 		return nil, fmt.Errorf("parse V2 response: %w", err)
 	}
 
-	monthlyUsage := v2.PremiumCredits.PerSource.MonthlyAllocated.UsageTotal
-	monthlyLimit := v2.PremiumCredits.PerSource.MonthlyAllocated.Limit
-	premiumRemaining := v2.PremiumCredits.TotalCreditBalance
-	// Some workspaces report remaining premium via monthlyAllocated usage/limit,
-	// while totalCreditBalance can stay at 0.
-	if premiumRemaining <= 0 && monthlyLimit > monthlyUsage {
-		premiumRemaining = monthlyLimit - monthlyUsage
-	}
-
-	// Merge V1 + V2 into QuotaInfo
-	info := &QuotaInfo{
-		IsEligible:        v1.IsEligible,
-		SpaceUsage:        v1.SpaceUsage,
-		SpaceLimit:        v1.SpaceLimit,
-		UserUsage:         v1.UserUsage,
-		UserLimit:         v1.UserLimit,
-		LastUsageAtMs:     v1.LastSpaceUsageAtMs,
-		ResearchModeUsage: v1.ResearchModeUsage,
-		// Premium credits from V2
-		PremiumBalance: premiumRemaining,
-		PremiumUsage:   monthlyUsage,
-		PremiumLimit:   monthlyLimit,
-	}
-	info.HasPremium = info.PremiumLimit > 0 ||
-		v2.PremiumCredits.PerSource.MonthlyCommitted.Limit > 0 ||
-		v2.PremiumCredits.PerSource.YearlyElastic.Limit > 0 ||
-		info.PremiumBalance > 0
-
-	return info, nil
+	return buildQuotaInfoFromResponses(v1, v2), nil
 }
 
 // CheckUserWorkspace probes /api/v3/loadUserContent and returns the number

@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -136,6 +137,7 @@ type anthropicInvocationError struct {
 	Status  int
 	Message string
 	Type    string
+	Code    string
 }
 
 type anthropicSSEFrame struct {
@@ -150,12 +152,15 @@ type anthropicStreamBridgeWriter struct {
 	buffer  strings.Builder
 	errBody bytes.Buffer
 	frames  chan string
+	done    chan struct{}
+	cancel  sync.Once
 }
 
 func newAnthropicStreamBridgeWriter() *anthropicStreamBridgeWriter {
 	return &anthropicStreamBridgeWriter{
 		header: make(http.Header),
 		frames: make(chan string, 64),
+		done:   make(chan struct{}),
 	}
 }
 
@@ -198,7 +203,11 @@ func (w *anthropicStreamBridgeWriter) Write(p []byte) (int, error) {
 	w.mu.Unlock()
 
 	for _, frame := range frames {
-		w.frames <- frame
+		select {
+		case w.frames <- frame:
+		case <-w.done:
+			return 0, context.Canceled
+		}
 	}
 	return len(p), nil
 }
@@ -211,9 +220,16 @@ func (w *anthropicStreamBridgeWriter) Close() {
 	w.buffer.Reset()
 	w.mu.Unlock()
 	if leftover != "" {
-		w.frames <- leftover
+		select {
+		case w.frames <- leftover:
+		case <-w.done:
+		}
 	}
 	close(w.frames)
+}
+
+func (w *anthropicStreamBridgeWriter) Cancel() {
+	w.cancel.Do(func() { close(w.done) })
 }
 
 func (w *anthropicStreamBridgeWriter) Status() int {
@@ -494,9 +510,9 @@ func (t *openAIResponsesStreamTranscoder) ensureMessageItem() error {
 		return err
 	}
 	return t.emit("response.content_part.added", map[string]interface{}{
-		"response_id":  t.responseID,
-		"item_id":      t.messageItemID,
-		"output_index": t.messageIndex,
+		"response_id":   t.responseID,
+		"item_id":       t.messageItemID,
+		"output_index":  t.messageIndex,
 		"content_index": 0,
 		"part": map[string]interface{}{
 			"type":        "output_text",
@@ -855,7 +871,7 @@ func HandleOpenAIChatCompletions(pool *AccountPool) http.HandlerFunc {
 
 		anthResp, invErr := invokeAnthropicNonStream(anthropicHandler, r, anthReq)
 		if invErr != nil {
-			writeOpenAIError(w, invErr.Status, invErr.Message, invErr.Type, "")
+			writeOpenAIErrorWithCode(w, invErr.Status, invErr.Message, invErr.Type, "", invErr.Code)
 			return
 		}
 
@@ -906,7 +922,7 @@ func HandleOpenAIResponses(pool *AccountPool) http.HandlerFunc {
 
 		anthResp, invErr := invokeAnthropicNonStream(anthropicHandler, r, anthReq)
 		if invErr != nil {
-			writeOpenAIError(w, invErr.Status, invErr.Message, invErr.Type, "")
+			writeOpenAIErrorWithCode(w, invErr.Status, invErr.Message, invErr.Type, "", invErr.Code)
 			return
 		}
 
@@ -918,22 +934,27 @@ func HandleOpenAIResponses(pool *AccountPool) http.HandlerFunc {
 }
 
 func streamAnthropicAsOpenAIChat(w http.ResponseWriter, r *http.Request, anthropicHandler http.HandlerFunc, anthropicReq *AnthropicRequest, responseID string, created int64, includeUsage bool) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeOpenAIError(w, http.StatusInternalServerError, "streaming not supported", "api_error", "")
+		return
+	}
 	bridge := newAnthropicStreamBridgeWriter()
 	innerReq, err := newAnthropicBridgeRequest(r, anthropicReq)
 	if err != nil {
 		writeOpenAIError(w, http.StatusInternalServerError, err.Error(), "api_error", "")
 		return
 	}
+	ctx, cancel := context.WithCancel(innerReq.Context())
+	innerReq = innerReq.WithContext(ctx)
+	defer func() {
+		cancel()
+		bridge.Cancel()
+	}()
 	go func() {
 		anthropicHandler(bridge, innerReq)
 		bridge.Close()
 	}()
-
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		writeOpenAIError(w, http.StatusInternalServerError, "streaming not supported", "api_error", "")
-		return
-	}
 	transcoder := newOpenAIChatStreamTranscoder(w, flusher, responseID, anthropicReq.Model, created, includeUsage)
 	headersSent := false
 	frameCount := 0
@@ -963,27 +984,32 @@ func streamAnthropicAsOpenAIChat(w http.ResponseWriter, r *http.Request, anthrop
 	log.Printf("[openai-chat] stream complete: %d frames, bridge status=%d", frameCount, bridge.Status())
 	if bridge.Status() != http.StatusOK {
 		invErr := parseAnthropicInvocationError(bridge.Status(), bridge.ErrorBody())
-		writeOpenAIError(w, invErr.Status, invErr.Message, invErr.Type, "")
+		writeOpenAIErrorWithCode(w, invErr.Status, invErr.Message, invErr.Type, "", invErr.Code)
 	}
 }
 
 func streamAnthropicAsOpenAIResponses(w http.ResponseWriter, r *http.Request, anthropicHandler http.HandlerFunc, anthropicReq *AnthropicRequest, responseID string, created int64) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeOpenAIError(w, http.StatusInternalServerError, "streaming not supported", "api_error", "")
+		return
+	}
 	bridge := newAnthropicStreamBridgeWriter()
 	innerReq, err := newAnthropicBridgeRequest(r, anthropicReq)
 	if err != nil {
 		writeOpenAIError(w, http.StatusInternalServerError, err.Error(), "api_error", "")
 		return
 	}
+	ctx, cancel := context.WithCancel(innerReq.Context())
+	innerReq = innerReq.WithContext(ctx)
+	defer func() {
+		cancel()
+		bridge.Cancel()
+	}()
 	go func() {
 		anthropicHandler(bridge, innerReq)
 		bridge.Close()
 	}()
-
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		writeOpenAIError(w, http.StatusInternalServerError, "streaming not supported", "api_error", "")
-		return
-	}
 	transcoder := newOpenAIResponsesStreamTranscoder(w, flusher, responseID, anthropicReq.Model, created)
 	headersSent := false
 	frameCount := 0
@@ -1020,7 +1046,7 @@ func streamAnthropicAsOpenAIResponses(w http.ResponseWriter, r *http.Request, an
 		frameCount, bridge.Status(), transcoder.messageText.Len())
 	if bridge.Status() != http.StatusOK {
 		invErr := parseAnthropicInvocationError(bridge.Status(), bridge.ErrorBody())
-		writeOpenAIError(w, invErr.Status, invErr.Message, invErr.Type, "")
+		writeOpenAIErrorWithCode(w, invErr.Status, invErr.Message, invErr.Type, "", invErr.Code)
 	}
 }
 
@@ -1070,6 +1096,7 @@ func parseAnthropicInvocationError(status int, body []byte) anthropicInvocationE
 		Error struct {
 			Type    string `json:"type"`
 			Message string `json:"message"`
+			Code    string `json:"code"`
 		} `json:"error"`
 	}
 	if json.Unmarshal(body, &payload) == nil && payload.Error.Message != "" {
@@ -1077,6 +1104,7 @@ func parseAnthropicInvocationError(status int, body []byte) anthropicInvocationE
 		if payload.Error.Type != "" {
 			invErr.Type = payload.Error.Type
 		}
+		invErr.Code = payload.Error.Code
 	}
 	return invErr
 }
@@ -1900,7 +1928,21 @@ func ensureJSONSchemaObject(schema interface{}) interface{} {
 }
 
 func writeOpenAIError(w http.ResponseWriter, status int, message, errType, param string) {
-	payload := OpenAIErrorResponse{Error: OpenAIError{Message: message, Type: errType, Param: param}}
+	publicErr := formatPublicAPIError(status, message, errType)
+	writeOpenAIErrorWithCode(w, status, publicErr.Message, errType, param, publicErr.Code)
+}
+
+func writeOpenAIErrorWithCode(w http.ResponseWriter, status int, message, errType, param, code string) {
+	if code == "" {
+		publicErr := formatPublicAPIError(status, message, errType)
+		message, code = publicErr.Message, publicErr.Code
+	}
+	payload := OpenAIErrorResponse{Error: OpenAIError{
+		Message: message,
+		Type:    publicAPIErrorType(errType, status),
+		Param:   param,
+		Code:    code,
+	}}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	json.NewEncoder(w).Encode(payload)
