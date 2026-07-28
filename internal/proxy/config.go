@@ -44,12 +44,16 @@ type ServerConfig struct {
 }
 
 type ProxyConfig struct {
-	NotionAPIBase         string `yaml:"notion_api_base"`
-	ClientVersion         string `yaml:"client_version"`
-	DefaultModel          string `yaml:"default_model"`
-	DisableNotionPrompt   bool   `yaml:"disable_notion_prompt"`
-	EnableWebSearch       *bool  `yaml:"enable_web_search"`
-	EnableWorkspaceSearch *bool  `yaml:"enable_workspace_search"`
+	NotionAPIBase           string `yaml:"notion_api_base"`
+	ClientVersion           string `yaml:"client_version"`
+	DefaultModel            string `yaml:"default_model"`
+	MaxConcurrency          int    `yaml:"max_concurrency"`
+	QuotaStrategy           string `yaml:"quota_strategy"`
+	AllowPremium            *bool  `yaml:"allow_premium"`
+	PremiumReserveThreshold int    `yaml:"premium_reserve_threshold"`
+	DisableNotionPrompt     bool   `yaml:"disable_notion_prompt"`
+	EnableWebSearch         *bool  `yaml:"enable_web_search"`
+	EnableWorkspaceSearch   *bool  `yaml:"enable_workspace_search"`
 	// AskModeDefault toggles Notion's ASK mode (frontend "Answers only,
 	// won't make edits" — config.useReadOnlyMode=true on the workflow
 	// thread). When true, all chat requests run in read-only mode by
@@ -124,12 +128,16 @@ func DefaultConfig() *Config {
 			NotionLogResp: false,
 		},
 		Proxy: ProxyConfig{
-			NotionAPIBase:         "https://www.notion.so/api/v3",
-			ClientVersion:         "23.13.20260313.1423",
-			DefaultModel:          "opus-4.6",
-			EnableWebSearch:       boolPtr(true),
-			EnableWorkspaceSearch: boolPtr(false),
-			AskModeDefault:        boolPtr(false),
+			NotionAPIBase:           "https://www.notion.so/api/v3",
+			ClientVersion:           "23.13.20260313.1423",
+			DefaultModel:            "opus-4.6",
+			MaxConcurrency:          1,
+			QuotaStrategy:           quotaStrategyBalanced,
+			AllowPremium:            boolPtr(true),
+			PremiumReserveThreshold: 0,
+			EnableWebSearch:         boolPtr(true),
+			EnableWorkspaceSearch:   boolPtr(false),
+			AskModeDefault:          boolPtr(false),
 		},
 		Timeouts: TimeoutConfig{
 			InferenceTimeout: 300,
@@ -234,6 +242,22 @@ func LoadConfig(configPath string) (*Config, error) {
 	}
 	if v := os.Getenv("DEFAULT_MODEL"); v != "" {
 		cfg.Proxy.DefaultModel = v
+	}
+	if v := os.Getenv("MAX_CONCURRENCY"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 1 && n <= 100 {
+			cfg.Proxy.MaxConcurrency = n
+		}
+	}
+	if v := os.Getenv("QUOTA_STRATEGY"); v != "" {
+		cfg.Proxy.QuotaStrategy = v
+	}
+	if v := os.Getenv("ALLOW_PREMIUM"); v != "" {
+		cfg.Proxy.AllowPremium = boolPtr(strings.EqualFold(v, "true") || v == "1")
+	}
+	if v := os.Getenv("PREMIUM_RESERVE_THRESHOLD"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			cfg.Proxy.PremiumReserveThreshold = n
+		}
 	}
 	if v := os.Getenv("INFERENCE_TIMEOUT"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
@@ -595,6 +619,53 @@ func (c *Config) AskModeDefault() bool {
 		return false
 	}
 	return *c.Proxy.AskModeDefault
+}
+
+// MaxConcurrency returns the per-account request concurrency cap.
+// Missing/invalid config falls back to 1; the dashboard validates 1..100.
+func (c *Config) MaxConcurrency() int {
+	if c == nil || c.Proxy.MaxConcurrency <= 0 {
+		return 1
+	}
+	if c.Proxy.MaxConcurrency > 100 {
+		return 100
+	}
+	return c.Proxy.MaxConcurrency
+}
+
+const (
+	quotaStrategyBalanced     = "balanced"
+	quotaStrategyBasicFirst   = "basic_first"
+	quotaStrategyPremiumFirst = "premium_first"
+)
+
+func normalizeQuotaStrategy(value string) string {
+	switch strings.TrimSpace(value) {
+	case quotaStrategyBasicFirst:
+		return quotaStrategyBasicFirst
+	case quotaStrategyPremiumFirst:
+		return quotaStrategyPremiumFirst
+	default:
+		return quotaStrategyBalanced
+	}
+}
+
+func (c *Config) QuotaStrategy() string {
+	if c == nil {
+		return quotaStrategyBalanced
+	}
+	return normalizeQuotaStrategy(c.Proxy.QuotaStrategy)
+}
+
+func (c *Config) AllowPremium() bool {
+	return c == nil || c.Proxy.AllowPremium == nil || *c.Proxy.AllowPremium
+}
+
+func (c *Config) PremiumReserveThreshold() int {
+	if c == nil || c.Proxy.PremiumReserveThreshold < 0 {
+		return 0
+	}
+	return c.Proxy.PremiumReserveThreshold
 }
 
 // NotionProxyURL returns the upstream proxy applied to all notion-bound

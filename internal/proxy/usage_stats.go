@@ -50,10 +50,28 @@ type UsageStats struct {
 	// Last record timestamp (unix ms).
 	LastRecordAtMs int64 `json:"last_record_at_ms"`
 
+	// Request log ring buffer (last requestLogCapacity entries, in-memory only).
+	// Not persisted across restarts to keep the stats file small.
+	RequestLogs []RequestLogEntry `json:"-"`
+
 	// Runtime-only.
 	path  string
 	dirty bool
 }
+
+// RequestLogEntry is a single request's usage record stored in the ring buffer.
+type RequestLogEntry struct {
+	Timestamp        time.Time `json:"timestamp"`
+	Model            string    `json:"model"`
+	Account          string    `json:"account"`
+	PromptTokens     int       `json:"prompt_tokens"`
+	CompletionTokens int       `json:"completion_tokens"`
+	TotalTokens      int       `json:"total_tokens"`
+}
+
+// requestLogCapacity is the maximum number of request log entries kept
+// in the in-memory ring buffer.
+const requestLogCapacity = 200
 
 // usageStatsSingleton is the global instance accessed by the proxy hot
 // path and the /admin/stats handler. It is initialised by InitUsageStats;
@@ -138,6 +156,20 @@ func (s *UsageStats) Record(account, model string, prompt, completion int) {
 
 	s.trimByDayLocked()
 	s.dirty = true
+
+	// Append to the request log ring buffer (newest at the end).
+	entry := RequestLogEntry{
+		Timestamp:        now,
+		Model:            model,
+		Account:          account,
+		PromptTokens:     prompt,
+		CompletionTokens: completion,
+		TotalTokens:      prompt + completion,
+	}
+	s.RequestLogs = append(s.RequestLogs, entry)
+	if len(s.RequestLogs) > requestLogCapacity {
+		s.RequestLogs = s.RequestLogs[len(s.RequestLogs)-requestLogCapacity:]
+	}
 }
 
 func bumpBucket(m map[string]*usageBucket, key string, prompt, completion int, withCount bool) {
@@ -279,6 +311,23 @@ func (s *UsageStats) Snapshot(topN int) UsageSnapshot {
 	})
 
 	return snap
+}
+
+// GetRequestLogs returns a copy of the request log ring buffer in reverse
+// chronological order (newest first). Safe to call from any goroutine.
+func (s *UsageStats) GetRequestLogs() []RequestLogEntry {
+	if s == nil {
+		return nil
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	n := len(s.RequestLogs)
+	out := make([]RequestLogEntry, n)
+	// Reverse so newest is first.
+	for i, entry := range s.RequestLogs {
+		out[n-1-i] = entry
+	}
+	return out
 }
 
 func topRows(src map[string]*usageBucket, n int, label func(key string, row *UsageRowSnapshot)) []UsageRowSnapshot {

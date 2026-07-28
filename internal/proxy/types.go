@@ -10,6 +10,7 @@ import (
 
 type Account struct {
 	mu            sync.RWMutex
+	refreshMu     sync.Mutex
 	TokenV2       string       `json:"token_v2"`
 	UserID        string       `json:"user_id"`
 	UserName      string       `json:"user_name"`
@@ -28,11 +29,19 @@ type Account struct {
 	// "microsoft"). Empty for accounts onboarded before the provider
 	// registry existed; the dashboard treats those as legacy Microsoft.
 	RegisteredVia string `json:"registered_via,omitempty"`
+	// Disabled allows manual disabling of an account from the dashboard.
+	// When true, the pool skips this account for all request routing.
+	// The flag persists to the account JSON file.
+	Disabled bool `json:"disabled,omitempty"`
 	// Runtime-only fields (not serialized)
 	QuotaExhaustedAt     *time.Time `json:"-"`
 	QuotaInfo            *QuotaInfo `json:"-"`
 	QuotaCheckedAt       *time.Time `json:"-"`
 	PermanentlyExhausted bool       `json:"-"`
+	// InFlight is runtime-only request accounting used by AccountPool leases.
+	// It is guarded by AccountPool.mu (not Account.mu) so account selection can
+	// atomically pick an account and reserve one concurrency slot.
+	InFlight int `json:"-"`
 	// Workspace probe state. SpaceCount is the number of `space_views`
 	// returned by /api/v3/loadUserContent for this account's user_root.
 	// 0 with WorkspaceCheckedAt != nil means the Notion onboarding

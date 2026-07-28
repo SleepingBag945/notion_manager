@@ -8,8 +8,14 @@ export interface AccountInfo {
   name: string
   plan: string
   space: string
+  // Optional until /admin/accounts exposes Account.SpaceID. The dashboard
+  // uses this for exact workspace aggregation when present.
+  space_id?: string
   exhausted: boolean
   permanent: boolean
+  // disabled is true when an admin has manually disabled this account
+  // from the dashboard. The pool skips disabled accounts for all routing.
+  disabled?: boolean
   // no_workspace is true when the backend probed loadUserContent and found
   // that user_root.space_views is empty — the /ai SPA gets stuck on a
   // skeleton screen for these accounts. Dashboard treats them as
@@ -174,4 +180,18 @@ export interface TokenStats {
   top_models: TokenModelRow[]
   top_accounts: TokenAccountRow[]
   last_record_at: number
+}
+
+export interface RequestLogEntry {
+  timestamp: string
+  model: string
+  account: string
+  prompt_tokens: number
+  completion_tokens: number
+  total_tokens: number
+}
+
+export interface RequestLogsResponse {
+  logs: RequestLogEntry[]
+  total: number
 }

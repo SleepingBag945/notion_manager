@@ -33,6 +33,7 @@ type AccountSummary struct {
 // as zero.
 func summarizeAccounts(accounts []map[string]interface{}) AccountSummary {
 	var s AccountSummary
+	seenSpaces := make(map[string]bool)
 	for _, a := range accounts {
 		exh := mapBool(a, "exhausted")
 		perm := mapBool(a, "permanent")
@@ -51,9 +52,17 @@ func summarizeAccounts(accounts []map[string]interface{}) AccountSummary {
 		}
 		s.TotalResearchUsage += mapInt(a, "research_usage")
 		s.TotalRemaining += mapInt(a, "remaining")
-		s.TotalSpaceUsage += mapInt(a, "space_usage")
-		s.TotalSpaceLimit += mapInt(a, "space_limit")
-		s.TotalSpaceRemaining += mapInt(a, "space_remaining")
+		spaceKey := strings.TrimSpace(mapString(a, "space_id"))
+		if spaceKey == "" {
+			// Legacy accounts without a SpaceID cannot be safely deduplicated.
+			spaceKey = "account:" + strings.ToLower(mapString(a, "email"))
+		}
+		if !seenSpaces[spaceKey] {
+			seenSpaces[spaceKey] = true
+			s.TotalSpaceUsage += mapInt(a, "space_usage")
+			s.TotalSpaceLimit += mapInt(a, "space_limit")
+			s.TotalSpaceRemaining += mapInt(a, "space_remaining")
+		}
 		s.TotalUserUsage += mapInt(a, "user_usage")
 		s.TotalUserLimit += mapInt(a, "user_limit")
 		s.TotalUserRemaining += mapInt(a, "user_remaining")

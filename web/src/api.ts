@@ -1,4 +1,4 @@
-import type { DashboardData, JobStartResponse, ProviderInfo, RegisterJob, TokenStats } from './types'
+import type { DashboardData, JobStartResponse, ProviderInfo, RegisterJob, RequestLogsResponse, TokenStats } from './types'
 
 // --- Auth API ---
 
@@ -256,6 +256,16 @@ export interface SearchSettings {
   // field via /admin/settings PUT immediately drops idle pooled
   // connections so subsequent requests pick up the new upstream.
   notion_proxy: string
+  // max_concurrency limits how many simultaneous requests may use one
+  // account. The backend owns enforcement; dashboard only edits the value.
+  max_concurrency: number
+  // Quota routing controls. Older backends may omit these additive fields;
+  // the dashboard applies safe defaults client-side and still sends them in
+  // PUT payloads for builds that support them.
+  quota_strategy: string
+  allow_premium: boolean
+  premium_reserve_threshold: number
+  quota_delta_tracking: boolean
 }
 
 export async function fetchSettings(): Promise<SearchSettings> {
@@ -265,7 +275,7 @@ export async function fetchSettings(): Promise<SearchSettings> {
   return resp.json()
 }
 
-export async function updateSettings(settings: Partial<Pick<SearchSettings, 'enable_web_search' | 'enable_workspace_search' | 'ask_mode_default' | 'debug_logging' | 'notion_proxy'>>): Promise<SearchSettings> {
+export async function updateSettings(settings: Partial<SearchSettings>): Promise<SearchSettings> {
   // Uses dashboard session cookie for auth (not API key)
   const resp = await fetch('/admin/settings', {
     method: 'PUT',
@@ -366,6 +376,24 @@ export async function deleteAccount(email: string): Promise<void> {
     credentials: 'same-origin',
   })
   await jsonOrError(resp)
+}
+
+export async function toggleAccount(email: string, disabled: boolean): Promise<void> {
+  const resp = await fetch('/admin/accounts/toggle', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+    credentials: 'same-origin',
+    body: JSON.stringify({ email, disabled }),
+  })
+  await jsonOrError(resp)
+}
+
+export async function fetchRequestLogs(): Promise<RequestLogsResponse> {
+  const resp = await fetch('/admin/logs', {
+    credentials: 'same-origin',
+  })
+  if (!resp.ok) throw new Error(`HTTP ${resp.status}`)
+  return resp.json()
 }
 
 export function jobEventsUrl(id: string): string {

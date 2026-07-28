@@ -16,6 +16,10 @@
   "account": {
     "no_workspace_alert": "该账号没有可访问的 Notion 工作区，无法打开 /ai 反代。请重新注册或选择其他账号。",
     "no_workspace_tooltip": "账号无可访问工作区，已被排除出选号池",
+    "disabled": "已禁用",
+    "disabled_status": "账号已禁用",
+    "disabled_alert": "该账号已被手动禁用，请先在菜单中启用。",
+    "disabled_tooltip": "账号已被手动禁用，已排除出调度池",
     "used": "已用 {{count}}",
     "no_workspace": "无工作区",
     "basic_remaining": "Basic 剩余",
@@ -24,7 +28,13 @@
     "recent_ai": "最近 AI {{date}}",
     "unavailable": "不可用 ⚠",
     "open_proxy": "打开代理 →",
-    "quota_unified": "Space / User 配额一致"
+    "quota_unified": "Space / User 配额一致",
+    "space_shared_basic": "工作区共享 Basic",
+    "user_personal_basic": "成员个人 Basic",
+    "premium_credits": "Premium Credits",
+    "space_remaining": "工作区剩余",
+    "user_remaining": "个人剩余",
+    "workspace_shared_hint": "同一工作区成员共享"
   },
   "stats": {
     "total_accounts": "总账号",
@@ -39,7 +49,8 @@
     "today_usage": "今日 {{today}} · 输入 {{input}} · 输出 {{output}}",
     "no_usage": "尚未产生用量",
     "basic_overview": "Basic 额度概览",
-    "remaining": "剩余"
+    "remaining": "剩余",
+    "used_percent": "已用 {{percent}}%"
   },
   "actions": {
     "open_best_account": "打开最优账号",
@@ -49,7 +60,8 @@
     "register_account": "注册账号",
     "history_tasks": "历史任务",
     "updated_at": "更新于 {{time}}",
-    "quota_refreshed_at": "配额刷新于 {{time}}"
+    "quota_refreshed_at": "配额刷新于 {{time}}",
+    "request_logs": "请求日志"
   },
   "api": {
     "settings_title": "API 设置",
@@ -67,7 +79,11 @@
     "workspace_search": "工作区搜索",
     "ask_mode": "ASK 模式",
     "debug_log": "调试日志",
-    "save_failed": "保存失败"
+    "save_failed": "保存失败",
+    "max_concurrency": "单账号并发",
+    "max_concurrency_desc": "每个账号允许同时处理的请求数",
+    "max_concurrency_hint": "1–100",
+    "saving": "保存中"
   },
   "modal": {
     "add": {
@@ -151,7 +167,9 @@
     "copy_token": "复制 token_v2",
     "open_proxy": "打开代理",
     "confirm_delete": "确认删除？",
-    "delete_account": "删除账号"
+    "delete_account": "删除账号",
+    "disable_account": "禁用账号",
+    "enable_account": "启用账号"
   },
   "common": {
     "cancel": "取消",
@@ -165,5 +183,27 @@
     "prev_page": "上一页",
     "next_page": "下一页",
     "status_refreshing": "正在刷新配额... {{current}}/{{total}}"
+  },
+  "quota_info": {
+    "open": "配额说明",
+    "title": "个人 / 团队空间配额说明",
+    "intro": "后台同时查询 Notion V2 与 V1 配额接口；V2 存在有效 basicCredits 时优先使用，V1 作为兼容回退。",
+    "space": "Space：当前团队空间共享的 Basic 使用量与上限。",
+    "user": "User：当前个人用户的 Basic 使用量与上限。",
+    "effective_basic": "实际可调度余额取 Space 剩余与 User 剩余的较小值，避免任一维度耗尽后继续派发。",
+    "source": "点击“刷新配额”会重新查询上游；卡片中的检查时间表示最近成功查询时间。",
+    "premium": "Premium 独立展示，不计入 Basic 余额；Research 仍受上游单独限制。",
+    "percent": "进度条百分比为已用量 ÷ 上限；0 上限显示为 0%。"
+  },
+  "request_logs": {
+    "title": "请求日志",
+    "refresh": "刷新",
+    "close": "关闭",
+    "loading": "加载中...",
+    "empty": "暂无请求记录",
+    "load_failed": "请求日志加载失败",
+    "unknown_model": "未知模型",
+    "account": "账号",
+    "tokens_detail": "输入 {{prompt}} · 输出 {{completion}}"
   }
 }

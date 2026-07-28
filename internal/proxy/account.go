@@ -45,6 +45,37 @@ type AccountPool struct {
 	liveQuotaInflight map[*Account]bool
 }
 
+// AccountLease reserves one per-account concurrency slot from an AccountPool.
+// Call Release exactly once when the request finishes. Release is idempotent so
+// callers may safely defer it on multiple return paths.
+type AccountLease struct {
+	pool *AccountPool
+	acc  *Account
+	once sync.Once
+}
+
+// Account returns the account held by this lease.
+func (l *AccountLease) Account() *Account {
+	if l == nil {
+		return nil
+	}
+	return l.acc
+}
+
+// Release returns the reserved concurrency slot to the pool.
+func (l *AccountLease) Release() {
+	if l == nil || l.pool == nil || l.acc == nil {
+		return
+	}
+	l.once.Do(func() {
+		l.pool.mu.Lock()
+		defer l.pool.mu.Unlock()
+		if l.acc.InFlight > 0 {
+			l.acc.InFlight--
+		}
+	})
+}
+
 func NewAccountPool() *AccountPool {
 	return &AccountPool{
 		liveQuotaInflight: make(map[*Account]bool),
@@ -409,11 +440,15 @@ func (p *AccountPool) pickBestAccountLocked(exclude map[*Account]bool) *Account 
 			continue
 		}
 		score := accountQuotaPriority(acc)
-		if score < 0 {
-			// Unknown quota — keep as fallback if no scored account exists
+		if score == -1 {
+			// Unknown quota — keep as fallback if no scored account exists.
 			if fallback == nil {
 				fallback = acc
 			}
+			continue
+		}
+		if score < -1 {
+			// Known quota, but policy leaves no usable balance.
 			continue
 		}
 		if best == nil || score > bestScore {
@@ -425,6 +460,85 @@ func (p *AccountPool) pickBestAccountLocked(exclude map[*Account]bool) *Account 
 		return best
 	}
 	return fallback
+}
+
+// NextBestLease atomically selects the best currently available account and
+// reserves one concurrency slot on it. Selection is the same highest-remaining
+// quota ordering as NextBest/NextBestExcluding, except accounts at the
+// configured per-account concurrency cap are skipped. If every otherwise
+// usable/non-excluded account is busy, ErrAllAccountsBusy is returned.
+func (p *AccountPool) NextBestLease(exclude map[*Account]bool) (*AccountLease, error) {
+	if p == nil {
+		return nil, nil
+	}
+	limit := 1
+	if AppConfig != nil {
+		limit = AppConfig.MaxConcurrency()
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	acc, busy := p.pickBestAccountForLeaseLocked(exclude, limit)
+	if acc == nil {
+		if busy {
+			return nil, ErrAllAccountsBusy
+		}
+		return nil, nil
+	}
+	acc.InFlight++
+	return &AccountLease{pool: p, acc: acc}, nil
+}
+
+func (p *AccountPool) pickBestAccountForLeaseLocked(exclude map[*Account]bool, limit int) (*Account, bool) {
+	n := len(p.accounts)
+	if n == 0 {
+		return nil, false
+	}
+	if limit <= 0 {
+		limit = 1
+	}
+	start := p.index.Add(1) - 1
+	var best *Account
+	var fallback *Account
+	bestScore := -1
+	sawBusy := false
+	for i := 0; i < n; i++ {
+		acc := p.accounts[(start+uint64(i))%uint64(n)]
+		if exclude != nil && exclude[acc] {
+			continue
+		}
+		if p.isUnusable(acc) {
+			continue
+		}
+		if acc.InFlight >= limit {
+			// A policy-disabled account is unavailable, not busy. Otherwise the
+			// caller should retry when a concurrency slot is released.
+			if accountQuotaPriorityIgnoringInflight(acc) >= -1 {
+				sawBusy = true
+			}
+			continue
+		}
+		score := accountQuotaPriority(acc)
+		if score < -1 {
+			// Known quota, but policy leaves no usable balance; this is not busy.
+			continue
+		}
+		if score == -1 {
+			if fallback == nil {
+				fallback = acc
+			}
+			continue
+		}
+		if best == nil || score > bestScore {
+			best = acc
+			bestScore = score
+		}
+	}
+	if best != nil {
+		return best, sawBusy
+	}
+	return fallback, sawBusy
 }
 
 // NextBest returns the next available account, preferring accounts with the
@@ -486,7 +600,13 @@ func (p *AccountPool) hasNoWorkspace(acc *Account) bool {
 // isUnusable folds quota-exhausted and no-workspace accounts into a
 // single "do not select" predicate used by every picker.
 func (p *AccountPool) isUnusable(acc *Account) bool {
-	return p.isQuotaExhausted(acc) || p.hasNoWorkspace(acc)
+	return acc.Disabled || p.isQuotaExhausted(acc) || p.hasNoWorkspace(acc)
+}
+
+func (p *AccountPool) IsUsableAccount(acc *Account) bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return acc != nil && !p.isUnusable(acc)
 }
 
 // applyWorkspaceCount records the latest probe result. Caller must NOT
@@ -508,6 +628,28 @@ func (p *AccountPool) applyWorkspaceCount(acc *Account, count int) (prev int, ch
 func (p *AccountPool) MarkPermanentlyExhausted(acc *Account) {
 	acc.markQuotaExhausted(time.Now(), true)
 	log.Printf("[quota] marked %s (%s) as PERMANENTLY exhausted (free plan, no recovery)", acc.UserName, acc.UserEmail)
+}
+
+// ToggleDisabled sets the manual disabled flag on the account identified by
+// email and persists the change to the account JSON file. When disabled is
+// true, the pool will skip this account for all request routing.
+func (p *AccountPool) ToggleDisabled(email string, disabled bool, accountsDir string) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	var target *Account
+	for _, acc := range p.accounts {
+		if strings.EqualFold(acc.UserEmail, email) {
+			target = acc
+			break
+		}
+	}
+	if target == nil {
+		return fmt.Errorf("account not found: %s", email)
+	}
+	target.Disabled = disabled
+
+	log.Printf("[disabled] %s -> %v", target.UserEmail, disabled)
+	return saveAccountFile(accountsDir, target)
 }
 
 // quotaApplyResult describes how applyQuotaInfo changed the account state.
@@ -1100,6 +1242,8 @@ func saveAccountFile(dir string, acc *Account) error {
 	if acc == nil {
 		return fmt.Errorf("saveAccountFile: nil account")
 	}
+	acc.mu.RLock()
+	defer acc.mu.RUnlock()
 	if dir == "" {
 		return fmt.Errorf("saveAccountFile: empty dir")
 	}
@@ -1163,6 +1307,8 @@ func saveAccountFile(dir string, acc *Account) error {
 		existing["space_count"] = acc.SpaceCount
 		existing["workspace_checked_at"] = acc.WorkspaceCheckedAt.Format(time.RFC3339)
 	}
+	// Persist the manual disabled flag so it survives restarts.
+	existing["disabled"] = acc.Disabled
 
 	out, err := json.MarshalIndent(existing, "", "  ")
 	if err != nil {
@@ -1215,6 +1361,8 @@ func (p *AccountPool) RefreshAndPersistAccount(ctx context.Context, accountsDir,
 	if acc == nil {
 		return fmt.Errorf("account not in pool: %s", email)
 	}
+	acc.refreshMu.Lock()
+	defer acc.refreshMu.Unlock()
 
 	info, err := quotaFetcher(acc)
 	if err != nil {
@@ -1278,8 +1426,10 @@ func (p *AccountPool) GetAccountDetails() []map[string]interface{} {
 			"name":         acc.UserName,
 			"plan":         acc.PlanType,
 			"space":        acc.SpaceName,
+			"space_id":     acc.SpaceID,
 			"exhausted":    p.isQuotaExhausted(acc),
 			"permanent":    quota.PermanentlyExhausted,
+			"disabled":     acc.Disabled,
 			"no_workspace": p.hasNoWorkspace(acc),
 			// token_v2 is exposed only behind dashboard auth (the caller of
 			// HandleAdminAccounts already gates on session). The dashboard
@@ -1479,23 +1629,63 @@ func basicRemaining(info *QuotaInfo) int {
 //     significant headroom so a premium account with low basic credits should
 //     still rank above a basic-only account that's nearly drained).
 //   - Basic-only account: basicRemaining (space ⊓ user).
+func accountQuotaPriorityIgnoringInflight(acc *Account) int {
+	return accountQuotaPriorityWithInflight(acc, 0)
+}
+
 func accountQuotaPriority(acc *Account) int {
+	if acc == nil {
+		return -2
+	}
+	return accountQuotaPriorityWithInflight(acc, acc.InFlight)
+}
+
+func accountQuotaPriorityWithInflight(acc *Account, inFlight int) int {
+	if acc == nil {
+		return -2
+	}
 	quota := acc.quotaInfoSnapshot()
 	if quota == nil {
 		return -1
 	}
-	score := basicRemaining(quota)
-	if quota.HasPremium {
-		// Premium balance often dwarfs basic credits — fold it in so premium
-		// accounts win over basic-only accounts when both are eligible.
-		score += quota.PremiumBalance
-		// If both basic and premium look exhausted but isEligible is still
-		// true (rare), keep premium accounts above unknown-quota fallback.
-		if score <= 0 {
-			score = 1
+	basic := basicRemaining(quota)
+	allowPremium := true
+	threshold := 0
+	strategy := quotaStrategyBalanced
+	if AppConfig != nil {
+		allowPremium = AppConfig.AllowPremium()
+		threshold = AppConfig.PremiumReserveThreshold()
+		strategy = AppConfig.QuotaStrategy()
+	}
+	premium := 0
+	if allowPremium && quota.HasPremium && quota.PremiumBalance > threshold {
+		premium = quota.PremiumBalance - threshold
+	}
+	if basic <= 0 && premium <= 0 {
+		return -2
+	}
+	const tier = 1_000_000
+	penalty := inFlight * tier / 4
+	if penalty > basic+premium {
+		penalty = basic + premium - 1
+		if penalty < 0 {
+			penalty = 0
 		}
 	}
-	return score
+	switch strategy {
+	case quotaStrategyBasicFirst:
+		if basic > 0 {
+			return tier + basic - penalty
+		}
+		return premium - penalty
+	case quotaStrategyPremiumFirst:
+		if premium > 0 {
+			return tier + premium - penalty
+		}
+		return basic - penalty
+	default:
+		return basic + premium - penalty
+	}
 }
 
 func generateUUIDv4() string {

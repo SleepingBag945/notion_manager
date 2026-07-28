@@ -1,8 +1,8 @@
 import { useEffect, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import type { AccountInfo } from '../types'
-import { deleteAccount, openProxy } from '../api'
-import { IconCopy, IconExternalLink, IconMore, IconTrash } from './Icons'
+import { deleteAccount, openProxy, toggleAccount } from '../api'
+import { IconCopy, IconExternalLink, IconMore, IconPower, IconTrash } from './Icons'
 
 interface Props {
   account: AccountInfo
@@ -18,6 +18,7 @@ export function AccountMenu({ account, onChanged }: Props) {
   const [copied, setCopied] = useState(false)
   const [deleting, setDeleting] = useState(false)
   const [confirming, setConfirming] = useState(false)
+  const [toggling, setToggling] = useState(false)
   const wrapRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
@@ -79,6 +80,20 @@ export function AccountMenu({ account, onChanged }: Props) {
     }
   }
 
+  const onToggleDisabled = async (e: React.MouseEvent) => {
+    e.stopPropagation()
+    setToggling(true)
+    try {
+      await toggleAccount(account.email, !account.disabled)
+      onChanged()
+    } catch (err) {
+      console.error('toggle account failed', err)
+    } finally {
+      setToggling(false)
+      setOpen(false)
+    }
+  }
+
   return (
     <div ref={wrapRef} className="relative" onClick={(e) => e.stopPropagation()}>
       <button
@@ -96,13 +111,18 @@ export function AccountMenu({ account, onChanged }: Props) {
           className="absolute right-0 top-7 z-30 w-44 bg-bg-secondary border border-border rounded-md shadow-xl shadow-black/40 py-1"
           onClick={(e) => e.stopPropagation()}
         >
-          <MenuItem
-            onClick={onCopyToken}
+          <MenuItem onClick={onCopyToken}
             disabled={!account.token_v2}
             icon={<IconCopy size={13} />}
             label={copied ? t('menu.copied') : t('menu.copy_token')}
           />
           <MenuItem onClick={onOpenProxy} icon={<IconExternalLink size={13} />} label={t('menu.open_proxy')} />
+          <MenuItem
+            onClick={onToggleDisabled}
+            disabled={toggling}
+            icon={<IconPower size={13} />}
+            label={account.disabled ? t('menu.enable_account') : t('menu.disable_account')}
+          />
           <div className="border-t border-border my-1" />
           <MenuItem
             onClick={onDelete}

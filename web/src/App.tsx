@@ -7,6 +7,7 @@ import { fmt, formatTokens, getQuotaStatusByUsage, getQuotaPct, avatarColor, ava
 import { AccountMenu } from './components/AccountMenu'
 import { RegisterModal } from './components/RegisterModal'
 import { HistoryDrawer } from './components/HistoryDrawer'
+import { RequestLogsDrawer } from './components/RequestLogsDrawer'
 import { LanguageToggle } from './components/LanguageToggle'
 import { IconUserPlus, IconHistory } from './components/Icons'
 
@@ -321,22 +322,59 @@ function hasPremiumAccess(account: AccountInfo): boolean {
   return !!account.has_premium || (account.premium_limit || 0) > 0 || (account.premium_balance || 0) > 0
 }
 
-function getSpaceQuota(account: AccountInfo) {
+type QuotaTuple = { usage: number; limit: number; remaining: number }
+
+function quotaRemainingValue(limit: number, usage: number, explicit?: number): number {
+  if (typeof explicit === 'number') return Math.max(explicit, 0)
+  if (limit <= 0) return 0
+  return Math.max(limit - usage, 0)
+}
+
+function getSpaceQuota(account: AccountInfo): QuotaTuple {
   const usage = account.space_usage ?? account.usage ?? 0
   const limit = account.space_limit ?? account.limit ?? 0
-  const remaining = account.space_remaining ?? Math.max(limit - usage, 0)
+  const remaining = quotaRemainingValue(limit, usage, account.space_remaining)
   return { usage, limit, remaining }
 }
 
-function getUserQuota(account: AccountInfo) {
+function getUserQuota(account: AccountInfo): QuotaTuple {
   const usage = account.user_usage ?? 0
   const limit = account.user_limit ?? 0
-  const remaining = account.user_remaining ?? Math.max(limit - usage, 0)
+  const remaining = quotaRemainingValue(limit, usage, account.user_remaining)
+  return { usage, limit, remaining }
+}
+
+function getPremiumQuota(account: AccountInfo): QuotaTuple {
+  const limit = account.premium_limit ?? 0
+  const balance = account.premium_balance ?? undefined
+  const usage = account.premium_usage ?? (typeof balance === 'number' ? Math.max(limit - balance, 0) : 0)
+  const remaining = quotaRemainingValue(limit, usage, balance)
   return { usage, limit, remaining }
 }
 
 function isSameQuota(a: { usage: number; limit: number }, b: { usage: number; limit: number }): boolean {
   return a.limit > 0 && a.limit === b.limit && a.usage === b.usage
+}
+
+function formatUsagePercent(usage?: number, limit?: number): number {
+  if (!limit) return 0
+  return Math.round(Math.min(((usage || 0) / limit) * 100, 100))
+}
+
+function normalizeMaxConcurrency(value: unknown): number {
+  const n = typeof value === 'number' ? value : Number.parseInt(String(value ?? ''), 10)
+  if (!Number.isFinite(n)) return 1
+  return Math.min(100, Math.max(1, Math.round(n)))
+}
+
+function normalizePremiumReserve(value: unknown): number {
+  const n = typeof value === 'number' ? value : Number.parseInt(String(value ?? ''), 10)
+  if (!Number.isFinite(n)) return 0
+  return Math.max(0, Math.round(n))
+}
+
+function resolveQuotaStrategy(value?: string): string {
+  return value && value.trim() ? value.trim() : 'balanced'
 }
 
 function isResearchLimited(account: AccountInfo): boolean {
@@ -352,7 +390,7 @@ function mergeQuotaStatus(statuses: Array<'ok' | 'low' | 'exhausted'>): 'ok' | '
 function OverviewBar({ label, usage, limit }: { label: string; usage: number; limit: number }) {
   const { t } = useTranslation()
   const pct = getQuotaPct(usage, limit)
-  const remaining = Math.max(limit - usage, 0)
+  const pctLabel = formatUsagePercent(usage, limit)
   const status = getQuotaStatusByUsage(usage, limit)
   const fillClass = status === 'exhausted' ? 'bg-err opacity-40'
     : status === 'low' ? 'bg-warn' : 'bg-ok'
@@ -364,7 +402,7 @@ function OverviewBar({ label, usage, limit }: { label: string; usage: number; li
       <div className="flex justify-between items-center mb-1.5">
         <span className="text-[10px] text-text-muted uppercase tracking-wider">{label}</span>
         <span className={`text-[11px] font-semibold tabular-nums ${numColor}`}>
-          {fmt(remaining)} <span className="text-text-muted font-normal">/ {fmt(limit)} {t('stats.remaining')}</span>
+          {fmt(usage)} <span className="text-text-muted font-normal">/ {fmt(limit)} · {t('stats.used_percent', { percent: pctLabel })}</span>
         </span>
       </div>
       <div className="h-[2px] bg-white/[.06] rounded-full overflow-hidden">
@@ -374,7 +412,7 @@ function OverviewBar({ label, usage, limit }: { label: string; usage: number; li
   )
 }
 
-function TotalQuotaBar({ summary }: { summary?: AccountSummary | null }) {
+function TotalQuotaBar({ summary, onExplain }: { summary?: AccountSummary | null; onExplain: () => void }) {
   const { t } = useTranslation()
   const totalSpaceUsage = summary?.total_space_usage ?? 0
   const totalSpaceLimit = summary?.total_space_limit ?? 0
@@ -390,7 +428,17 @@ function TotalQuotaBar({ summary }: { summary?: AccountSummary | null }) {
   return (
     <div className="mb-5 space-y-3">
       <div className="flex justify-between items-center">
-        <span className="text-[11px] text-text-secondary uppercase tracking-wider flex items-center gap-1.5"><IconBarChart /> {t('stats.basic_overview')}</span>
+        <div className="flex items-center gap-2">
+          <span className="text-[11px] text-text-secondary uppercase tracking-wider flex items-center gap-1.5"><IconBarChart /> {t('stats.basic_overview')}</span>
+          <button
+            type="button"
+            onClick={onExplain}
+            className="text-[11px] text-text-muted hover:text-text-primary bg-transparent border border-border hover:border-white/20 rounded px-1.5 py-0.5 cursor-pointer transition-colors"
+            title={t('quota_info.open')}
+          >
+            {t('quota_info.open')}
+          </button>
+        </div>
         {totalPremiumLimit > 0 && (
           <span className="text-[12px] text-text-muted tabular-nums">
             {t('stats.premium_remaining')} <span className="text-[#7eb8ff] font-semibold">{fmt(totalPremiumBalance)}</span> / {fmt(totalPremiumLimit)}
@@ -409,8 +457,54 @@ function TotalQuotaBar({ summary }: { summary?: AccountSummary | null }) {
   )
 }
 
+function QuotaInfoModal({ open, onClose }: { open: boolean; onClose: () => void }) {
+  const { t } = useTranslation()
+
+  useEffect(() => {
+    if (!open) return
+    const handler = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
+    window.addEventListener('keydown', handler)
+    return () => window.removeEventListener('keydown', handler)
+  }, [open, onClose])
+
+  if (!open) return null
+
+  return (
+    <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/60 backdrop-blur-sm" onClick={onClose}>
+      <div className="w-full max-w-lg bg-[#1a1a1a] border border-white/10 rounded-xl shadow-2xl p-6" onClick={e => e.stopPropagation()}>
+        <div className="flex items-center justify-between mb-4">
+          <h2 className="text-[16px] font-semibold">{t('quota_info.title')}</h2>
+          <button onClick={onClose} className="text-text-muted hover:text-white bg-transparent border-none cursor-pointer text-lg px-1">×</button>
+        </div>
+        <div className="text-[13px] text-text-secondary space-y-3 leading-relaxed">
+          <p>{t('quota_info.intro')}</p>
+          <ul className="list-disc pl-5 space-y-2">
+            <li>{t('quota_info.space')}</li>
+            <li>{t('quota_info.user')}</li>
+            <li>{t('quota_info.effective_basic')}</li>
+            <li>{t('quota_info.source')}</li>
+            <li>{t('quota_info.premium')}</li>
+            <li>{t('quota_info.percent')}</li>
+          </ul>
+        </div>
+        <div className="flex justify-end mt-5">
+          <button
+            type="button"
+            onClick={onClose}
+            className="px-4 py-2 bg-white hover:bg-white/90 text-black rounded-lg text-[13px] font-semibold cursor-pointer transition-colors border-none"
+          >
+            {t('common.close')}
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 function QuotaBar({ label, labelClass, usage, limit, status }: { label: string; labelClass?: string; usage?: number; limit?: number; status?: 'ok' | 'low' | 'exhausted' }) {
+  const { t } = useTranslation()
   const pct = getQuotaPct(usage, limit)
+  const pctLabel = formatUsagePercent(usage, limit)
   const resolvedStatus = status || getQuotaStatusByUsage(usage, limit)
   const fillClass = resolvedStatus === 'exhausted' ? 'bg-err opacity-40'
     : resolvedStatus === 'low' ? 'bg-warn' : 'bg-ok'
@@ -422,7 +516,7 @@ function QuotaBar({ label, labelClass, usage, limit, status }: { label: string; 
       <div className="flex justify-between items-baseline mb-1">
         <span className={`text-[10px] ${labelClass || 'text-text-muted'}`}>{label}</span>
         <span className={`text-[11px] font-semibold tabular-nums ${numColor}`}>
-          {fmt(usage || 0)} <span className="text-text-muted font-normal">/</span> {fmt(limit || 0)}
+          {fmt(usage || 0)} <span className="text-text-muted font-normal">/</span> {fmt(limit || 0)} <span className="text-text-muted font-normal">· {t('stats.used_percent', { percent: pctLabel })}</span>
         </span>
       </div>
       <div className="h-[2px] bg-white/[.06] rounded-full overflow-hidden">
@@ -432,12 +526,13 @@ function QuotaBar({ label, labelClass, usage, limit, status }: { label: string; 
   )
 }
 
-function Badge({ children, variant }: { children: React.ReactNode; variant: 'plan' | 'premium' | 'research' | 'warning' | 'model' }) {
+function Badge({ children, variant }: { children: React.ReactNode; variant: 'plan' | 'premium' | 'research' | 'warning' | 'disabled' | 'model' }) {
   const cls: Record<string, string> = {
     plan: 'text-text-secondary',
     premium: 'text-[#7eb8ff]',
     research: 'text-research',
     warning: 'text-red-400 bg-red-500/10 px-1.5 rounded',
+    disabled: 'text-text-muted bg-white/[.06] px-1.5 rounded',
     model: 'text-text-secondary hover:text-white transition-colors cursor-pointer',
   }
   return (
@@ -452,11 +547,11 @@ function AccountCard({ account, onChanged }: { account: AccountInfo; onChanged: 
   const [showModels, setShowModels] = useState(false)
   const spaceQuota = getSpaceQuota(account)
   const userQuota = getUserQuota(account)
-  const sameBasicQuota = isSameQuota(spaceQuota, userQuota)
   const premium = hasPremiumAccess(account)
   const researchLimited = isResearchLimited(account)
   const noWorkspace = !!account.no_workspace
-  const status = account.permanent || account.exhausted || noWorkspace
+  const disabled = !!account.disabled
+  const status = account.permanent || account.exhausted || noWorkspace || disabled
     ? 'exhausted'
     : mergeQuotaStatus([
       getQuotaStatusByUsage(spaceQuota.usage, spaceQuota.limit),
@@ -464,16 +559,22 @@ function AccountCard({ account, onChanged }: { account: AccountInfo; onChanged: 
     ])
   const modelCount = account.models?.length || 0
 
-  const dotCls = status === 'exhausted' ? 'bg-err' : status === 'low' ? 'bg-err' : 'bg-ok'
+  const dotCls = disabled ? 'bg-text-muted' : status === 'exhausted' ? 'bg-err' : status === 'low' ? 'bg-err' : 'bg-ok'
   // no_workspace shares the exhausted card style so the operator
   // immediately sees the account is unhealthy. Click-through is blocked
   // because Notion's /ai SPA hangs indefinitely on these accounts (the
   // root-cause this fix is for).
-  const cardBg = account.permanent ? 'bg-bg-exhausted border-white/[0.03] opacity-55'
+  const blocked = disabled || noWorkspace
+  const cardBg = disabled ? 'bg-bg-card border-white/[0.03] opacity-50 grayscale'
+    : account.permanent ? 'bg-bg-exhausted border-white/[0.03] opacity-55'
     : account.exhausted || noWorkspace ? 'bg-bg-exhausted border-white/[0.03]'
     : 'bg-bg-card hover:bg-bg-card-hover border-white/[0.03] hover:border-white/[0.07]'
 
   const handleClick = () => {
+    if (disabled) {
+      alert(t('account.disabled_alert'))
+      return
+    }
     if (noWorkspace) {
       // Use a native alert — we don't have a toast infra and openProxy
       // would otherwise pop a tab that displays raw JSON 409 to the user.
@@ -485,9 +586,9 @@ function AccountCard({ account, onChanged }: { account: AccountInfo; onChanged: 
 
   return (
     <div
-      className={`rounded-lg p-4 border ${noWorkspace ? 'cursor-not-allowed' : 'cursor-pointer hover:-translate-y-0.5 hover:shadow-lg hover:shadow-black/30'} transition-all duration-200 ${cardBg}`}
+      className={`rounded-lg p-4 border ${blocked ? 'cursor-not-allowed' : 'cursor-pointer hover:-translate-y-0.5 hover:shadow-lg hover:shadow-black/30'} transition-all duration-200 ${cardBg}`}
       onClick={handleClick}
-      title={noWorkspace ? t('account.no_workspace_tooltip') : undefined}
+      title={disabled ? t('account.disabled_tooltip') : noWorkspace ? t('account.no_workspace_tooltip') : undefined}
     >
       {/* Header */}
       <div className="flex items-center gap-2.5 mb-2.5">
@@ -524,6 +625,7 @@ function AccountCard({ account, onChanged }: { account: AccountInfo; onChanged: 
         )}
         {account.exhausted && !account.permanent && <Badge variant="warning">Basic blocked</Badge>}
         {account.permanent && <Badge variant="warning">Free cap</Badge>}
+        {disabled && <Badge variant="disabled">{t('account.disabled')}</Badge>}
         {noWorkspace && <Badge variant="warning">{t('account.no_workspace')}</Badge>}
         {modelCount > 0 && (
           <button
@@ -535,19 +637,14 @@ function AccountCard({ account, onChanged }: { account: AccountInfo; onChanged: 
         )}
       </div>
 
-      {/* Quotas */}
-      {sameBasicQuota ? (
-        <QuotaBar label="Basic" usage={spaceQuota.usage} limit={spaceQuota.limit} />
-      ) : (
-        <>
-          <QuotaBar label="Space" usage={spaceQuota.usage} limit={spaceQuota.limit} />
-          {userQuota.limit > 0 && <QuotaBar label="User" usage={userQuota.usage} limit={userQuota.limit} />}
-        </>
-      )}
-      {premium && <QuotaBar label="Premium" labelClass="text-[#7eb8ff]" usage={account.premium_usage} limit={account.premium_limit} />}
-      <div className="flex flex-wrap gap-3 mt-2 text-[10px] text-text-muted">
-        <span>{t('account.basic_remaining')} {fmt(account.remaining || 0)}</span>
-        {premium && <span>{t('account.premium_remaining')} {fmt(account.premium_balance || 0)}</span>}
+      {/* Quotas: Space is shared by the workspace; User and Premium belong to this account. */}
+      <QuotaBar label={t('account.space_shared_basic')} usage={spaceQuota.usage} limit={spaceQuota.limit} />
+      {userQuota.limit > 0 && <QuotaBar label={t('account.user_personal_basic')} usage={userQuota.usage} limit={userQuota.limit} />}
+      {premium && <QuotaBar label={t('account.premium_credits')} labelClass="text-[#7eb8ff]" usage={getPremiumQuota(account).usage} limit={getPremiumQuota(account).limit} />}
+      <div className="flex flex-col gap-1 mt-2 text-[10px] text-text-muted">
+        <span>{t('account.space_remaining')} {fmt(spaceQuota.remaining)} · {t('account.workspace_shared_hint')}</span>
+        {userQuota.limit > 0 && <span>{t('account.user_remaining')} {fmt(userQuota.remaining)}</span>}
+        {premium && <span>{t('account.premium_remaining')} {fmt(getPremiumQuota(account).remaining)}</span>}
       </div>
 
       {/* Models (expandable) */}
@@ -567,7 +664,9 @@ function AccountCard({ account, onChanged }: { account: AccountInfo; onChanged: 
           <IconClock />
           <span className="truncate">{t('account.last_checked', { date: formatCheckedAt(account.checked_at) })} · {t('account.recent_ai', { date: formatTimestampMs(account.last_usage_at) })}</span>
         </span>
-        {noWorkspace ? (
+        {disabled ? (
+          <span className="text-[11px] text-text-muted font-medium">{t('account.disabled_status')}</span>
+        ) : noWorkspace ? (
           <span className="text-[11px] text-err font-medium">{t('account.unavailable')}</span>
         ) : (
           <span className="text-[11px] text-text-secondary hover:text-white font-medium transition-colors">{t('account.open_proxy')}</span>
@@ -595,6 +694,8 @@ export default function App() {
   const [apiKeyRevealed, setApiKeyRevealed] = useState(false)
   const [registerOpen, setRegisterOpen] = useState(false)
   const [historyOpen, setHistoryOpen] = useState(false)
+  const [requestLogsOpen, setRequestLogsOpen] = useState(false)
+  const [quotaInfoOpen, setQuotaInfoOpen] = useState(false)
   const [copiedField, setCopiedField] = useState<'key' | 'base' | null>(null)
   const [showAddModal, setShowAddModal] = useState(false)
   const copyToClipboard = (text: string, field: 'key' | 'base') => {
@@ -608,6 +709,10 @@ export default function App() {
   const [proxyDraft, setProxyDraft] = useState('')
   const [proxyError, setProxyError] = useState<string | null>(null)
   const [proxySaving, setProxySaving] = useState(false)
+  const [maxConcurrencyDraft, setMaxConcurrencyDraft] = useState('1')
+  const [maxConcurrencyError, setMaxConcurrencyError] = useState<string | null>(null)
+  const [maxConcurrencySaving, setMaxConcurrencySaving] = useState(false)
+  const [premiumReserveDraft, setPremiumReserveDraft] = useState('0')
   const PAGE_SIZE = 20
 
   // Debounced query: typing in the search box shouldn't fire a request
@@ -668,6 +773,8 @@ export default function App() {
       .then(s => {
         setSettings(s)
         setProxyDraft(s.notion_proxy ?? '')
+        setMaxConcurrencyDraft(String(normalizeMaxConcurrency(s.max_concurrency)))
+        setPremiumReserveDraft(String(normalizePremiumReserve(s.premium_reserve_threshold)))
       })
       .catch(() => {})
     fetchTokenStats().then(setTokenStats).catch(() => {})
@@ -695,7 +802,7 @@ export default function App() {
     setQuotaRefreshing(false)
   }
 
-  const toggleSetting = async (key: 'enable_web_search' | 'enable_workspace_search' | 'ask_mode_default' | 'debug_logging') => {
+  const toggleSetting = async (key: 'enable_web_search' | 'enable_workspace_search' | 'ask_mode_default' | 'debug_logging' | 'allow_premium') => {
     if (!settings) return
     const newVal = !settings[key]
     try {
@@ -728,6 +835,48 @@ export default function App() {
       setProxyDraft(settings.notion_proxy ?? '')
     } finally {
       setProxySaving(false)
+    }
+  }
+
+  const saveMaxConcurrency = async () => {
+    if (!settings) return
+    const next = normalizeMaxConcurrency(maxConcurrencyDraft)
+    setMaxConcurrencyDraft(String(next))
+    if (next === normalizeMaxConcurrency(settings.max_concurrency)) {
+      setMaxConcurrencyError(null)
+      return
+    }
+    setMaxConcurrencySaving(true)
+    setMaxConcurrencyError(null)
+    try {
+      const updated = await updateSettings({ max_concurrency: next })
+      setSettings(updated)
+      setMaxConcurrencyDraft(String(normalizeMaxConcurrency(updated.max_concurrency)))
+    } catch (e: any) {
+      setMaxConcurrencyError(e?.message || t('api.save_failed'))
+      setMaxConcurrencyDraft(String(normalizeMaxConcurrency(settings.max_concurrency)))
+    } finally {
+      setMaxConcurrencySaving(false)
+    }
+  }
+
+  const saveQuotaStrategy = async (value: string) => {
+    if (!settings) return
+    try {
+      setSettings(await updateSettings({ quota_strategy: resolveQuotaStrategy(value) }))
+    } catch { /* keep previous */ }
+  }
+
+  const savePremiumReserve = async () => {
+    if (!settings) return
+    const next = normalizePremiumReserve(premiumReserveDraft)
+    setPremiumReserveDraft(String(next))
+    try {
+      const updated = await updateSettings({ premium_reserve_threshold: next })
+      setSettings(updated)
+      setPremiumReserveDraft(String(normalizePremiumReserve(updated.premium_reserve_threshold)))
+    } catch {
+      setPremiumReserveDraft(String(normalizePremiumReserve(settings.premium_reserve_threshold)))
     }
   }
 
@@ -864,7 +1013,7 @@ export default function App() {
         )}
 
         {/* Total Quota Bar */}
-        <TotalQuotaBar summary={data?.summary} />
+        <TotalQuotaBar summary={data?.summary} onExplain={() => setQuotaInfoOpen(true)} />
 
         {/* Refresh Status Banner */}
         {refreshStatus?.refreshing && (
@@ -923,6 +1072,12 @@ export default function App() {
             className="inline-flex items-center gap-1.5 px-4 py-2 bg-bg-card hover:bg-bg-card-hover text-text-primary rounded-md text-[13px] font-medium cursor-pointer transition-colors border border-border"
           >
             <IconHistory size={13} /> {t('actions.history_tasks')}
+          </button>
+          <button
+            onClick={() => setRequestLogsOpen(true)}
+            className="inline-flex items-center gap-1.5 px-4 py-2 bg-bg-card hover:bg-bg-card-hover text-text-primary rounded-md text-[13px] font-medium cursor-pointer transition-colors border border-border"
+          >
+            <IconActivity /> {t('actions.request_logs')}
           </button>
           {refreshTime && (
             <span className="text-[11px] text-text-muted">
@@ -1005,6 +1160,57 @@ export default function App() {
                       className={`text-[11px] bg-white/[.05] px-1.5 py-0.5 rounded font-mono outline-none border w-[160px] focus:w-[280px] transition-[width,border-color] duration-150 ${proxyError ? 'border-err text-err' : 'border-transparent focus:border-white/20 text-text-primary'} placeholder:text-text-muted/60`}
                       title={proxyError || (settings.notion_proxy ? t('api.current_proxy', { proxy: settings.notion_proxy }) : t('api.current_direct'))}
                     />
+                  </div>
+                  <div className="flex items-center gap-1.5">
+                    <span className="text-[11px] text-text-muted">额度调度</span>
+                    <select
+                      value={resolveQuotaStrategy(settings.quota_strategy)}
+                      onChange={e => saveQuotaStrategy(e.target.value)}
+                      className="text-[11px] bg-white/[.05] px-1.5 py-0.5 border border-white/10 text-text-primary"
+                    >
+                      <option value="balanced">均衡消耗</option>
+                      <option value="basic_first">基础额度优先</option>
+                      <option value="premium_first">Premium 优先</option>
+                    </select>
+                    <label className="flex items-center gap-1 text-[11px] text-text-muted">
+                      <input type="checkbox" checked={settings.allow_premium ?? true} onChange={() => toggleSetting('allow_premium')} />
+                      使用 Premium
+                    </label>
+                    <span className="text-[11px] text-text-muted">保留</span>
+                    <input
+                      type="number" min={0} step={1} value={premiumReserveDraft}
+                      onChange={e => setPremiumReserveDraft(e.target.value)}
+                      onBlur={savePremiumReserve}
+                      onKeyDown={e => { if (e.key === 'Enter') (e.target as HTMLInputElement).blur() }}
+                      className="text-[11px] bg-white/[.05] px-1.5 py-0.5 font-mono outline-none border border-white/10 w-16 text-text-primary"
+                    />
+                  </div>
+                  <div className="flex items-center gap-1.5" title={maxConcurrencyError || t('api.max_concurrency_desc')}>
+                    <span className="text-[11px] text-text-muted">{t('api.max_concurrency')}</span>
+                    <span
+                      className={`inline-block w-1.5 h-1.5 rounded-full ${maxConcurrencyError ? 'bg-err' : maxConcurrencySaving ? 'bg-warn' : 'bg-ok'}`}
+                      title={maxConcurrencyError || (maxConcurrencySaving ? t('api.saving') : t('api.max_concurrency_desc'))}
+                    />
+                    <input
+                      type="number"
+                      min={1}
+                      max={100}
+                      step={1}
+                      value={maxConcurrencyDraft}
+                      onChange={e => { setMaxConcurrencyDraft(e.target.value); if (maxConcurrencyError) setMaxConcurrencyError(null) }}
+                      onBlur={saveMaxConcurrency}
+                      onKeyDown={e => {
+                        if (e.key === 'Enter') (e.target as HTMLInputElement).blur()
+                        if (e.key === 'Escape') {
+                          setMaxConcurrencyDraft(String(normalizeMaxConcurrency(settings.max_concurrency)))
+                          setMaxConcurrencyError(null)
+                          ;(e.target as HTMLInputElement).blur()
+                        }
+                      }}
+                      disabled={maxConcurrencySaving}
+                      className={`text-[11px] bg-white/[.05] px-1.5 py-0.5 rounded font-mono outline-none border w-16 transition-colors duration-150 ${maxConcurrencyError ? 'border-err text-err' : 'border-transparent focus:border-white/20 text-text-primary'} disabled:opacity-60`}
+                    />
+                    <span className="text-[10px] text-text-muted">{t('api.max_concurrency_hint')}</span>
                   </div>
                 </div>
                 <div className="flex items-center gap-5 ml-auto">
@@ -1133,6 +1339,14 @@ export default function App() {
           // own poller picks up live counters in the meantime.
           window.setTimeout(() => { loadData() }, 4000)
         }}
+      />
+      <RequestLogsDrawer
+        open={requestLogsOpen}
+        onClose={() => setRequestLogsOpen(false)}
+      />
+      <QuotaInfoModal
+        open={quotaInfoOpen}
+        onClose={() => setQuotaInfoOpen(false)}
       />
     </div>
   )

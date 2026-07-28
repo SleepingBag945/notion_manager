@@ -39,6 +39,12 @@ export const IconAlert = ({ size, className }: IconProps) => (
   </svg>
 )
 
+export const IconActivity = ({ size, className }: IconProps) => (
+  <svg {...baseProps(size)} className={className}>
+    <polyline points="22 12 18 12 15 21 9 3 6 12 2 12" />
+  </svg>
+)
+
 export const IconCopy = ({ size, className }: IconProps) => (
   <svg {...baseProps(size)} className={className}>
     <rect x="9" y="9" width="13" height="13" rx="2" ry="2" />
@@ -109,6 +115,14 @@ export const IconExternalLink = ({ size, className }: IconProps) => (
 export const IconChevronRight = ({ size, className }: IconProps) => (
   <svg {...baseProps(size)} className={className}>
     <polyline points="9 18 15 12 9 6" />
+  </svg>
+)
+
+// Power icon for enable/disable toggle.
+export const IconPower = ({ size, className }: IconProps) => (
+  <svg {...baseProps(size)} className={className}>
+    <path d="M18.36 6.64a9 9 0 1 1-12.73 0" />
+    <line x1="12" y1="2" x2="12" y2="12" />
   </svg>
 )
 
