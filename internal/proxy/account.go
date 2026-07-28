@@ -440,11 +440,15 @@ func (p *AccountPool) pickBestAccountLocked(exclude map[*Account]bool) *Account 
 			continue
 		}
 		score := accountQuotaPriority(acc)
-		if score < 0 {
-			// Unknown quota — keep as fallback if no scored account exists
+		if score == -1 {
+			// Unknown quota — keep as fallback if no scored account exists.
 			if fallback == nil {
 				fallback = acc
 			}
+			continue
+		}
+		if score < -1 {
+			// Known quota, but policy leaves no usable balance.
 			continue
 		}
 		if best == nil || score > bestScore {
@@ -508,11 +512,19 @@ func (p *AccountPool) pickBestAccountForLeaseLocked(exclude map[*Account]bool, l
 			continue
 		}
 		if acc.InFlight >= limit {
-			sawBusy = true
+			// A policy-disabled account is unavailable, not busy. Otherwise the
+			// caller should retry when a concurrency slot is released.
+			if accountQuotaPriorityIgnoringInflight(acc) >= -1 {
+				sawBusy = true
+			}
 			continue
 		}
 		score := accountQuotaPriority(acc)
-		if score < 0 {
+		if score < -1 {
+			// Known quota, but policy leaves no usable balance; this is not busy.
+			continue
+		}
+		if score == -1 {
 			if fallback == nil {
 				fallback = acc
 			}
@@ -1414,6 +1426,7 @@ func (p *AccountPool) GetAccountDetails() []map[string]interface{} {
 			"name":         acc.UserName,
 			"plan":         acc.PlanType,
 			"space":        acc.SpaceName,
+			"space_id":     acc.SpaceID,
 			"exhausted":    p.isQuotaExhausted(acc),
 			"permanent":    quota.PermanentlyExhausted,
 			"disabled":     acc.Disabled,
@@ -1616,23 +1629,63 @@ func basicRemaining(info *QuotaInfo) int {
 //     significant headroom so a premium account with low basic credits should
 //     still rank above a basic-only account that's nearly drained).
 //   - Basic-only account: basicRemaining (space ⊓ user).
+func accountQuotaPriorityIgnoringInflight(acc *Account) int {
+	return accountQuotaPriorityWithInflight(acc, 0)
+}
+
 func accountQuotaPriority(acc *Account) int {
+	if acc == nil {
+		return -2
+	}
+	return accountQuotaPriorityWithInflight(acc, acc.InFlight)
+}
+
+func accountQuotaPriorityWithInflight(acc *Account, inFlight int) int {
+	if acc == nil {
+		return -2
+	}
 	quota := acc.quotaInfoSnapshot()
 	if quota == nil {
 		return -1
 	}
-	score := basicRemaining(quota)
-	if quota.HasPremium {
-		// Premium balance often dwarfs basic credits — fold it in so premium
-		// accounts win over basic-only accounts when both are eligible.
-		score += quota.PremiumBalance
-		// If both basic and premium look exhausted but isEligible is still
-		// true (rare), keep premium accounts above unknown-quota fallback.
-		if score <= 0 {
-			score = 1
+	basic := basicRemaining(quota)
+	allowPremium := true
+	threshold := 0
+	strategy := quotaStrategyBalanced
+	if AppConfig != nil {
+		allowPremium = AppConfig.AllowPremium()
+		threshold = AppConfig.PremiumReserveThreshold()
+		strategy = AppConfig.QuotaStrategy()
+	}
+	premium := 0
+	if allowPremium && quota.HasPremium && quota.PremiumBalance > threshold {
+		premium = quota.PremiumBalance - threshold
+	}
+	if basic <= 0 && premium <= 0 {
+		return -2
+	}
+	const tier = 1_000_000
+	penalty := inFlight * tier / 4
+	if penalty > basic+premium {
+		penalty = basic + premium - 1
+		if penalty < 0 {
+			penalty = 0
 		}
 	}
-	return score
+	switch strategy {
+	case quotaStrategyBasicFirst:
+		if basic > 0 {
+			return tier + basic - penalty
+		}
+		return premium - penalty
+	case quotaStrategyPremiumFirst:
+		if premium > 0 {
+			return tier + premium - penalty
+		}
+		return basic - penalty
+	default:
+		return basic + premium - penalty
+	}
 }
 
 func generateUUIDv4() string {

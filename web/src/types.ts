@@ -8,6 +8,9 @@ export interface AccountInfo {
   name: string
   plan: string
   space: string
+  // Optional until /admin/accounts exposes Account.SpaceID. The dashboard
+  // uses this for exact workspace aggregation when present.
+  space_id?: string
   exhausted: boolean
   permanent: boolean
   // disabled is true when an admin has manually disabled this account

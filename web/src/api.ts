@@ -259,6 +259,13 @@ export interface SearchSettings {
   // max_concurrency limits how many simultaneous requests may use one
   // account. The backend owns enforcement; dashboard only edits the value.
   max_concurrency: number
+  // Quota routing controls. Older backends may omit these additive fields;
+  // the dashboard applies safe defaults client-side and still sends them in
+  // PUT payloads for builds that support them.
+  quota_strategy: string
+  allow_premium: boolean
+  premium_reserve_threshold: number
+  quota_delta_tracking: boolean
 }
 
 export async function fetchSettings(): Promise<SearchSettings> {
@@ -268,7 +275,7 @@ export async function fetchSettings(): Promise<SearchSettings> {
   return resp.json()
 }
 
-export async function updateSettings(settings: Partial<Pick<SearchSettings, 'enable_web_search' | 'enable_workspace_search' | 'ask_mode_default' | 'debug_logging' | 'notion_proxy' | 'max_concurrency'>>): Promise<SearchSettings> {
+export async function updateSettings(settings: Partial<SearchSettings>): Promise<SearchSettings> {
   // Uses dashboard session cookie for auth (not API key)
   const resp = await fetch('/admin/settings', {
     method: 'PUT',

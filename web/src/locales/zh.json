@@ -28,7 +28,13 @@
     "recent_ai": "最近 AI {{date}}",
     "unavailable": "不可用 ⚠",
     "open_proxy": "打开代理 →",
-    "quota_unified": "Space / User 配额一致"
+    "quota_unified": "Space / User 配额一致",
+    "space_shared_basic": "工作区共享 Basic",
+    "user_personal_basic": "成员个人 Basic",
+    "premium_credits": "Premium Credits",
+    "space_remaining": "工作区剩余",
+    "user_remaining": "个人剩余",
+    "workspace_shared_hint": "同一工作区成员共享"
   },
   "stats": {
     "total_accounts": "总账号",

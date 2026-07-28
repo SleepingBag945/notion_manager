@@ -321,23 +321,29 @@ func HandleAdminSettings(configPath string, auth *DashboardAuth) http.HandlerFun
 		switch r.Method {
 		case "GET":
 			json.NewEncoder(w).Encode(map[string]interface{}{
-				"enable_web_search":       AppConfig.WebSearchEnabled(),
-				"enable_workspace_search": AppConfig.WorkspaceSearchEnabled(),
-				"ask_mode_default":        AppConfig.AskModeDefault(),
-				"max_concurrency":         AppConfig.MaxConcurrency(),
-				"disable_notion_prompt":   AppConfig.Proxy.DisableNotionPrompt,
-				"debug_logging":           AppConfig.Server.DebugLogging,
-				"notion_proxy":            AppConfig.NotionProxyURL(),
+				"enable_web_search":         AppConfig.WebSearchEnabled(),
+				"enable_workspace_search":   AppConfig.WorkspaceSearchEnabled(),
+				"ask_mode_default":          AppConfig.AskModeDefault(),
+				"max_concurrency":           AppConfig.MaxConcurrency(),
+				"quota_strategy":            AppConfig.QuotaStrategy(),
+				"allow_premium":             AppConfig.AllowPremium(),
+				"premium_reserve_threshold": AppConfig.PremiumReserveThreshold(),
+				"disable_notion_prompt":     AppConfig.Proxy.DisableNotionPrompt,
+				"debug_logging":             AppConfig.Server.DebugLogging,
+				"notion_proxy":              AppConfig.NotionProxyURL(),
 			})
 
 		case "PUT":
 			var body struct {
-				EnableWebSearch       *bool   `json:"enable_web_search"`
-				EnableWorkspaceSearch *bool   `json:"enable_workspace_search"`
-				AskModeDefault        *bool   `json:"ask_mode_default"`
-				MaxConcurrency        *int    `json:"max_concurrency"`
-				DebugLogging          *bool   `json:"debug_logging"`
-				NotionProxy           *string `json:"notion_proxy"`
+				EnableWebSearch         *bool   `json:"enable_web_search"`
+				EnableWorkspaceSearch   *bool   `json:"enable_workspace_search"`
+				AskModeDefault          *bool   `json:"ask_mode_default"`
+				MaxConcurrency          *int    `json:"max_concurrency"`
+				QuotaStrategy           *string `json:"quota_strategy"`
+				AllowPremium            *bool   `json:"allow_premium"`
+				PremiumReserveThreshold *int    `json:"premium_reserve_threshold"`
+				DebugLogging            *bool   `json:"debug_logging"`
+				NotionProxy             *string `json:"notion_proxy"`
 			}
 			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 				http.Error(w, `{"error":"invalid request body"}`, http.StatusBadRequest)
@@ -369,6 +375,27 @@ func HandleAdminSettings(configPath string, auth *DashboardAuth) http.HandlerFun
 				AppConfig.Proxy.MaxConcurrency = *body.MaxConcurrency
 				changed = true
 				log.Printf("[settings] max_concurrency → %d", *body.MaxConcurrency)
+			}
+			if body.QuotaStrategy != nil {
+				next := strings.TrimSpace(*body.QuotaStrategy)
+				if next != quotaStrategyBalanced && next != quotaStrategyBasicFirst && next != quotaStrategyPremiumFirst {
+					http.Error(w, `{"error":"quota_strategy must be balanced, basic_first or premium_first"}`, http.StatusBadRequest)
+					return
+				}
+				AppConfig.Proxy.QuotaStrategy = next
+				changed = true
+			}
+			if body.AllowPremium != nil {
+				AppConfig.Proxy.AllowPremium = body.AllowPremium
+				changed = true
+			}
+			if body.PremiumReserveThreshold != nil {
+				if *body.PremiumReserveThreshold < 0 {
+					http.Error(w, `{"error":"premium_reserve_threshold must be >= 0"}`, http.StatusBadRequest)
+					return
+				}
+				AppConfig.Proxy.PremiumReserveThreshold = *body.PremiumReserveThreshold
+				changed = true
 			}
 			if body.DebugLogging != nil {
 				AppConfig.Server.DebugLogging = *body.DebugLogging
@@ -412,13 +439,16 @@ func HandleAdminSettings(configPath string, auth *DashboardAuth) http.HandlerFun
 			}
 
 			json.NewEncoder(w).Encode(map[string]interface{}{
-				"enable_web_search":       AppConfig.WebSearchEnabled(),
-				"enable_workspace_search": AppConfig.WorkspaceSearchEnabled(),
-				"ask_mode_default":        AppConfig.AskModeDefault(),
-				"max_concurrency":         AppConfig.MaxConcurrency(),
-				"disable_notion_prompt":   AppConfig.Proxy.DisableNotionPrompt,
-				"debug_logging":           AppConfig.Server.DebugLogging,
-				"notion_proxy":            AppConfig.NotionProxyURL(),
+				"enable_web_search":         AppConfig.WebSearchEnabled(),
+				"enable_workspace_search":   AppConfig.WorkspaceSearchEnabled(),
+				"ask_mode_default":          AppConfig.AskModeDefault(),
+				"max_concurrency":           AppConfig.MaxConcurrency(),
+				"quota_strategy":            AppConfig.QuotaStrategy(),
+				"allow_premium":             AppConfig.AllowPremium(),
+				"premium_reserve_threshold": AppConfig.PremiumReserveThreshold(),
+				"disable_notion_prompt":     AppConfig.Proxy.DisableNotionPrompt,
+				"debug_logging":             AppConfig.Server.DebugLogging,
+				"notion_proxy":              AppConfig.NotionProxyURL(),
 			})
 
 		default:
@@ -447,6 +477,9 @@ func persistSearchSettings(configPath string) {
 		setYAMLBool(proxyNode, "enable_workspace_search", AppConfig.WorkspaceSearchEnabled())
 		setYAMLBool(proxyNode, "ask_mode_default", AppConfig.AskModeDefault())
 		setYAMLInt(proxyNode, "max_concurrency", AppConfig.MaxConcurrency())
+		setYAMLString(proxyNode, "quota_strategy", AppConfig.QuotaStrategy())
+		setYAMLBool(proxyNode, "allow_premium", AppConfig.AllowPremium())
+		setYAMLInt(proxyNode, "premium_reserve_threshold", AppConfig.PremiumReserveThreshold())
 		setYAMLString(proxyNode, "notion_proxy", AppConfig.Proxy.NotionProxy)
 
 		serverNode := getOrCreateYAMLMapping(mapping, "server")

@@ -322,17 +322,33 @@ function hasPremiumAccess(account: AccountInfo): boolean {
   return !!account.has_premium || (account.premium_limit || 0) > 0 || (account.premium_balance || 0) > 0
 }
 
-function getSpaceQuota(account: AccountInfo) {
+type QuotaTuple = { usage: number; limit: number; remaining: number }
+
+function quotaRemainingValue(limit: number, usage: number, explicit?: number): number {
+  if (typeof explicit === 'number') return Math.max(explicit, 0)
+  if (limit <= 0) return 0
+  return Math.max(limit - usage, 0)
+}
+
+function getSpaceQuota(account: AccountInfo): QuotaTuple {
   const usage = account.space_usage ?? account.usage ?? 0
   const limit = account.space_limit ?? account.limit ?? 0
-  const remaining = account.space_remaining ?? Math.max(limit - usage, 0)
+  const remaining = quotaRemainingValue(limit, usage, account.space_remaining)
   return { usage, limit, remaining }
 }
 
-function getUserQuota(account: AccountInfo) {
+function getUserQuota(account: AccountInfo): QuotaTuple {
   const usage = account.user_usage ?? 0
   const limit = account.user_limit ?? 0
-  const remaining = account.user_remaining ?? Math.max(limit - usage, 0)
+  const remaining = quotaRemainingValue(limit, usage, account.user_remaining)
+  return { usage, limit, remaining }
+}
+
+function getPremiumQuota(account: AccountInfo): QuotaTuple {
+  const limit = account.premium_limit ?? 0
+  const balance = account.premium_balance ?? undefined
+  const usage = account.premium_usage ?? (typeof balance === 'number' ? Math.max(limit - balance, 0) : 0)
+  const remaining = quotaRemainingValue(limit, usage, balance)
   return { usage, limit, remaining }
 }
 
@@ -349,6 +365,16 @@ function normalizeMaxConcurrency(value: unknown): number {
   const n = typeof value === 'number' ? value : Number.parseInt(String(value ?? ''), 10)
   if (!Number.isFinite(n)) return 1
   return Math.min(100, Math.max(1, Math.round(n)))
+}
+
+function normalizePremiumReserve(value: unknown): number {
+  const n = typeof value === 'number' ? value : Number.parseInt(String(value ?? ''), 10)
+  if (!Number.isFinite(n)) return 0
+  return Math.max(0, Math.round(n))
+}
+
+function resolveQuotaStrategy(value?: string): string {
+  return value && value.trim() ? value.trim() : 'balanced'
 }
 
 function isResearchLimited(account: AccountInfo): boolean {
@@ -521,7 +547,6 @@ function AccountCard({ account, onChanged }: { account: AccountInfo; onChanged: 
   const [showModels, setShowModels] = useState(false)
   const spaceQuota = getSpaceQuota(account)
   const userQuota = getUserQuota(account)
-  const sameBasicQuota = isSameQuota(spaceQuota, userQuota)
   const premium = hasPremiumAccess(account)
   const researchLimited = isResearchLimited(account)
   const noWorkspace = !!account.no_workspace
@@ -612,19 +637,14 @@ function AccountCard({ account, onChanged }: { account: AccountInfo; onChanged: 
         )}
       </div>
 
-      {/* Quotas */}
-      {sameBasicQuota ? (
-        <QuotaBar label="Basic" usage={spaceQuota.usage} limit={spaceQuota.limit} />
-      ) : (
-        <>
-          <QuotaBar label="Space" usage={spaceQuota.usage} limit={spaceQuota.limit} />
-          {userQuota.limit > 0 && <QuotaBar label="User" usage={userQuota.usage} limit={userQuota.limit} />}
-        </>
-      )}
-      {premium && <QuotaBar label="Premium" labelClass="text-[#7eb8ff]" usage={account.premium_usage} limit={account.premium_limit} />}
-      <div className="flex flex-wrap gap-3 mt-2 text-[10px] text-text-muted">
-        <span>{t('account.basic_remaining')} {fmt(account.remaining || 0)}</span>
-        {premium && <span>{t('account.premium_remaining')} {fmt(account.premium_balance || 0)}</span>}
+      {/* Quotas: Space is shared by the workspace; User and Premium belong to this account. */}
+      <QuotaBar label={t('account.space_shared_basic')} usage={spaceQuota.usage} limit={spaceQuota.limit} />
+      {userQuota.limit > 0 && <QuotaBar label={t('account.user_personal_basic')} usage={userQuota.usage} limit={userQuota.limit} />}
+      {premium && <QuotaBar label={t('account.premium_credits')} labelClass="text-[#7eb8ff]" usage={getPremiumQuota(account).usage} limit={getPremiumQuota(account).limit} />}
+      <div className="flex flex-col gap-1 mt-2 text-[10px] text-text-muted">
+        <span>{t('account.space_remaining')} {fmt(spaceQuota.remaining)} · {t('account.workspace_shared_hint')}</span>
+        {userQuota.limit > 0 && <span>{t('account.user_remaining')} {fmt(userQuota.remaining)}</span>}
+        {premium && <span>{t('account.premium_remaining')} {fmt(getPremiumQuota(account).remaining)}</span>}
       </div>
 
       {/* Models (expandable) */}
@@ -692,6 +712,7 @@ export default function App() {
   const [maxConcurrencyDraft, setMaxConcurrencyDraft] = useState('1')
   const [maxConcurrencyError, setMaxConcurrencyError] = useState<string | null>(null)
   const [maxConcurrencySaving, setMaxConcurrencySaving] = useState(false)
+  const [premiumReserveDraft, setPremiumReserveDraft] = useState('0')
   const PAGE_SIZE = 20
 
   // Debounced query: typing in the search box shouldn't fire a request
@@ -753,6 +774,7 @@ export default function App() {
         setSettings(s)
         setProxyDraft(s.notion_proxy ?? '')
         setMaxConcurrencyDraft(String(normalizeMaxConcurrency(s.max_concurrency)))
+        setPremiumReserveDraft(String(normalizePremiumReserve(s.premium_reserve_threshold)))
       })
       .catch(() => {})
     fetchTokenStats().then(setTokenStats).catch(() => {})
@@ -780,7 +802,7 @@ export default function App() {
     setQuotaRefreshing(false)
   }
 
-  const toggleSetting = async (key: 'enable_web_search' | 'enable_workspace_search' | 'ask_mode_default' | 'debug_logging') => {
+  const toggleSetting = async (key: 'enable_web_search' | 'enable_workspace_search' | 'ask_mode_default' | 'debug_logging' | 'allow_premium') => {
     if (!settings) return
     const newVal = !settings[key]
     try {
@@ -835,6 +857,26 @@ export default function App() {
       setMaxConcurrencyDraft(String(normalizeMaxConcurrency(settings.max_concurrency)))
     } finally {
       setMaxConcurrencySaving(false)
+    }
+  }
+
+  const saveQuotaStrategy = async (value: string) => {
+    if (!settings) return
+    try {
+      setSettings(await updateSettings({ quota_strategy: resolveQuotaStrategy(value) }))
+    } catch { /* keep previous */ }
+  }
+
+  const savePremiumReserve = async () => {
+    if (!settings) return
+    const next = normalizePremiumReserve(premiumReserveDraft)
+    setPremiumReserveDraft(String(next))
+    try {
+      const updated = await updateSettings({ premium_reserve_threshold: next })
+      setSettings(updated)
+      setPremiumReserveDraft(String(normalizePremiumReserve(updated.premium_reserve_threshold)))
+    } catch {
+      setPremiumReserveDraft(String(normalizePremiumReserve(settings.premium_reserve_threshold)))
     }
   }
 
@@ -1117,6 +1159,30 @@ export default function App() {
                       disabled={proxySaving}
                       className={`text-[11px] bg-white/[.05] px-1.5 py-0.5 rounded font-mono outline-none border w-[160px] focus:w-[280px] transition-[width,border-color] duration-150 ${proxyError ? 'border-err text-err' : 'border-transparent focus:border-white/20 text-text-primary'} placeholder:text-text-muted/60`}
                       title={proxyError || (settings.notion_proxy ? t('api.current_proxy', { proxy: settings.notion_proxy }) : t('api.current_direct'))}
+                    />
+                  </div>
+                  <div className="flex items-center gap-1.5">
+                    <span className="text-[11px] text-text-muted">额度调度</span>
+                    <select
+                      value={resolveQuotaStrategy(settings.quota_strategy)}
+                      onChange={e => saveQuotaStrategy(e.target.value)}
+                      className="text-[11px] bg-white/[.05] px-1.5 py-0.5 border border-white/10 text-text-primary"
+                    >
+                      <option value="balanced">均衡消耗</option>
+                      <option value="basic_first">基础额度优先</option>
+                      <option value="premium_first">Premium 优先</option>
+                    </select>
+                    <label className="flex items-center gap-1 text-[11px] text-text-muted">
+                      <input type="checkbox" checked={settings.allow_premium ?? true} onChange={() => toggleSetting('allow_premium')} />
+                      使用 Premium
+                    </label>
+                    <span className="text-[11px] text-text-muted">保留</span>
+                    <input
+                      type="number" min={0} step={1} value={premiumReserveDraft}
+                      onChange={e => setPremiumReserveDraft(e.target.value)}
+                      onBlur={savePremiumReserve}
+                      onKeyDown={e => { if (e.key === 'Enter') (e.target as HTMLInputElement).blur() }}
+                      className="text-[11px] bg-white/[.05] px-1.5 py-0.5 font-mono outline-none border border-white/10 w-16 text-text-primary"
                     />
                   </div>
                   <div className="flex items-center gap-1.5" title={maxConcurrencyError || t('api.max_concurrency_desc')}>

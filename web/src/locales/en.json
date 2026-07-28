@@ -28,7 +28,13 @@
     "disabled": "Disabled",
     "disabled_status": "Account disabled",
     "disabled_alert": "This account is manually disabled. Enable it from the menu first.",
-    "disabled_tooltip": "Manually disabled and excluded from scheduling"
+    "disabled_tooltip": "Manually disabled and excluded from scheduling",
+    "space_shared_basic": "Workspace Shared Basic",
+    "user_personal_basic": "Member Personal Basic",
+    "premium_credits": "Premium Credits",
+    "space_remaining": "Workspace remaining",
+    "user_remaining": "Personal remaining",
+    "workspace_shared_hint": "shared by members in the same workspace"
   },
   "stats": {
     "total_accounts": "Total Accounts",
