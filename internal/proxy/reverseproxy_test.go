@@ -4,6 +4,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 )
@@ -26,6 +27,18 @@ func reverseProxyResponse(status int, location string) *http.Response {
 	}
 }
 
+func cookieValues(header, name string) []string {
+	req := &http.Request{Header: make(http.Header)}
+	req.Header.Set("Cookie", header)
+	var values []string
+	for _, cookie := range req.Cookies() {
+		if cookie.Name == name {
+			values = append(values, cookie.Value)
+		}
+	}
+	return values
+}
+
 func TestAccountCookieHeaderFallback(t *testing.T) {
 	acc := &Account{
 		TokenV2:   "token",
@@ -39,16 +52,25 @@ func TestAccountCookieHeaderFallback(t *testing.T) {
 	}
 }
 
-func TestAccountCookieHeaderPreservesFullCookie(t *testing.T) {
-	const fullCookie = "token_v2=full; custom=value; spaced=kept exactly"
-	acc := &Account{TokenV2: "fallback", FullCookie: fullCookie}
-	if got := accountCookieHeader(acc); got != fullCookie {
-		t.Fatalf("accountCookieHeader() = %q, want exact FullCookie %q", got, fullCookie)
+func TestAccountCookieHeaderFiltersFullCookieAndKeepsStableSeeds(t *testing.T) {
+	acc := &Account{
+		TokenV2:   "stable-token",
+		UserID:    "stable-user",
+		BrowserID: "stable-browser",
+		DeviceID:  "stable-device",
+		FullCookie: "token_v2=stale-token; notion_user_id=stale-user; notion_locale=zh-CN; " +
+			"notion_check_cookie_consent=true; sync_session=stale; sync_session_v2=stale; " +
+			"session_sync_nonce=stale; session_sync_checked=stale; custom=value",
+	}
+	want := "token_v2=stable-token; notion_user_id=stable-user; notion_browser_id=stable-browser; " +
+		"device_id=stable-device; notion_locale=zh-CN; notion_check_cookie_consent=true"
+	if got := accountCookieHeader(acc); got != want {
+		t.Fatalf("accountCookieHeader() = %q, want %q", got, want)
 	}
 }
 
 func TestReverseProxyRedirectReinjectsCookieAndUpdatesHost(t *testing.T) {
-	acc := &Account{TokenV2: "token"}
+	sess := newProxySession(&Account{TokenV2: "token"})
 	var requests []*http.Request
 	transport := reverseProxyRoundTripper(func(req *http.Request) (*http.Response, error) {
 		requests = append(requests, req.Clone(req.Context()))
@@ -62,8 +84,8 @@ func TestReverseProxyRedirectReinjectsCookieAndUpdatesHost(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	req.Header.Set("Cookie", accountCookieHeader(acc))
-	resp, err := newReverseProxyHTTPClient(0, transport, acc).Do(req)
+	setProxySessionCookies(req, sess)
+	resp, err := newReverseProxyHTTPClient(0, transport, sess).Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -80,8 +102,116 @@ func TestReverseProxyRedirectReinjectsCookieAndUpdatesHost(t *testing.T) {
 	}
 }
 
+func TestReverseProxyRedirectPersistsIntermediateCookie(t *testing.T) {
+	sess := newProxySession(&Account{TokenV2: "token"})
+	var requests []*http.Request
+	transport := reverseProxyRoundTripper(func(req *http.Request) (*http.Response, error) {
+		requests = append(requests, req.Clone(req.Context()))
+		if len(requests) == 1 {
+			resp := reverseProxyResponse(http.StatusTemporaryRedirect, "https://app.notion.com/space/sessionSyncCallback")
+			resp.Header.Add("Set-Cookie", "sync_session=dynamic; Path=/; Secure; HttpOnly")
+			return resp, nil
+		}
+		return reverseProxyResponse(http.StatusOK, ""), nil
+	})
+
+	req, err := http.NewRequest(http.MethodGet, "https://app.notion.com/ai", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	setProxySessionCookies(req, sess)
+	resp, err := newReverseProxyHTTPClient(0, transport, sess).Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+
+	if len(requests) != 2 {
+		t.Fatalf("requests = %d, want 2", len(requests))
+	}
+	if got := cookieValues(requests[1].Header.Get("Cookie"), "sync_session"); len(got) != 1 || got[0] != "dynamic" {
+		t.Fatalf("redirect sync_session cookies = %v, want [dynamic]", got)
+	}
+}
+
+func TestReverseProxyFinalCookiePersistsAcrossRequests(t *testing.T) {
+	sess := newProxySession(&Account{TokenV2: "token"})
+	var requests []*http.Request
+	transport := reverseProxyRoundTripper(func(req *http.Request) (*http.Response, error) {
+		requests = append(requests, req.Clone(req.Context()))
+		resp := reverseProxyResponse(http.StatusOK, "")
+		if len(requests) == 1 {
+			resp.Header.Add("Set-Cookie", "session_sync_checked=true; Path=/; Secure; HttpOnly")
+		}
+		return resp, nil
+	})
+
+	for _, path := range []string{"/ai", "/api/v3/loadUserContent"} {
+		req, err := http.NewRequest(http.MethodGet, "https://app.notion.com"+path, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		setProxySessionCookies(req, sess)
+		resp, err := newReverseProxyHTTPClient(0, transport, sess).Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+	}
+
+	if got := cookieValues(requests[1].Header.Get("Cookie"), "session_sync_checked"); len(got) != 1 || got[0] != "true" {
+		t.Fatalf("second request session_sync_checked cookies = %v, want [true]", got)
+	}
+}
+
+func TestReverseProxyJarCookieOverridesSeedWithoutDuplicate(t *testing.T) {
+	sess := newProxySession(&Account{TokenV2: "seed-token"})
+	var requests []*http.Request
+	transport := reverseProxyRoundTripper(func(req *http.Request) (*http.Response, error) {
+		requests = append(requests, req.Clone(req.Context()))
+		if len(requests) == 1 {
+			resp := reverseProxyResponse(http.StatusTemporaryRedirect, "/callback")
+			resp.Header.Add("Set-Cookie", "token_v2=jar-token; Path=/; Secure; HttpOnly")
+			return resp, nil
+		}
+		return reverseProxyResponse(http.StatusOK, ""), nil
+	})
+
+	req, err := http.NewRequest(http.MethodGet, "https://app.notion.com/ai", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	setProxySessionCookies(req, sess)
+	resp, err := newReverseProxyHTTPClient(0, transport, sess).Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+
+	if got := cookieValues(requests[1].Header.Get("Cookie"), "token_v2"); len(got) != 1 || got[0] != "jar-token" {
+		t.Fatalf("redirect token_v2 cookies = %v, want exactly [jar-token]", got)
+	}
+}
+
+func TestReverseProxyCookieJarsAreIsolated(t *testing.T) {
+	url, err := url.Parse("https://app.notion.com/ai")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessA := newProxySession(&Account{TokenV2: "token"})
+	sessB := newProxySession(&Account{TokenV2: "token"})
+	sessA.CookieJar.SetCookies(url, []*http.Cookie{{Name: "sync_session", Value: "session-a", Path: "/", Secure: true}})
+
+	if got := cookieValues(proxySessionCookieHeader(sessA, url), "sync_session"); len(got) != 1 || got[0] != "session-a" {
+		t.Fatalf("session A sync_session cookies = %v, want [session-a]", got)
+	}
+	if got := cookieValues(proxySessionCookieHeader(sessB, url), "sync_session"); len(got) != 0 {
+		t.Fatalf("session B unexpectedly received session A cookies: %v", got)
+	}
+}
+
 func TestReverseProxyRedirectBlocksUnknownHostWithoutRequest(t *testing.T) {
-	acc := &Account{TokenV2: "secret"}
+	sess := newProxySession(&Account{TokenV2: "secret"})
 	requests := 0
 	evilRequests := 0
 	transport := reverseProxyRoundTripper(func(req *http.Request) (*http.Response, error) {
@@ -99,8 +229,8 @@ func TestReverseProxyRedirectBlocksUnknownHostWithoutRequest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	req.Header.Set("Cookie", accountCookieHeader(acc))
-	_, err = newReverseProxyHTTPClient(0, transport, acc).Do(req)
+	setProxySessionCookies(req, sess)
+	_, err = newReverseProxyHTTPClient(0, transport, sess).Do(req)
 	if err == nil {
 		t.Fatal("unknown redirect unexpectedly succeeded")
 	}
@@ -120,7 +250,9 @@ func TestReverseProxyRedirectLimit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = newReverseProxyHTTPClient(0, transport, &Account{TokenV2: "token"}).Do(req)
+	sess := newProxySession(&Account{TokenV2: "token"})
+	setProxySessionCookies(req, sess)
+	_, err = newReverseProxyHTTPClient(0, transport, sess).Do(req)
 	if err == nil {
 		t.Fatal("redirect chain unexpectedly succeeded")
 	}
@@ -145,10 +277,41 @@ func TestProxyMsgstoreRejectsUntrustedHostBeforeRequest(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	request := httptest.NewRequest(http.MethodGet, "/capture", nil)
 	rp := &ReverseProxy{}
-	rp.proxyMsgstoreHTTP(recorder, request, &ProxySession{Account: &Account{TokenV2: "secret"}}, "attacker.example", "/capture")
+	rp.proxyMsgstoreHTTP(recorder, request, newProxySession(&Account{TokenV2: "secret"}), "attacker.example", "/capture")
 
 	if recorder.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusBadRequest)
+	}
+}
+
+func TestProxyMsgstoreHTTPUsesSessionCookieJar(t *testing.T) {
+	sess := newProxySession(&Account{TokenV2: "token"})
+	var requests []*http.Request
+	rp := &ReverseProxy{
+		msgTransport: reverseProxyRoundTripper(func(req *http.Request) (*http.Response, error) {
+			requests = append(requests, req.Clone(req.Context()))
+			resp := reverseProxyResponse(http.StatusOK, "")
+			if len(requests) == 1 {
+				resp.Header.Add("Set-Cookie", "AWSALBAPP-0=sticky; Path=/; Secure; HttpOnly")
+			}
+			return resp, nil
+		}),
+	}
+
+	for range 2 {
+		recorder := httptest.NewRecorder()
+		request := httptest.NewRequest(http.MethodGet, "/primus-v8/", nil)
+		rp.proxyMsgstoreHTTP(recorder, request, sess, msgstoreHost, "/primus-v8/")
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("msgstore status = %d, want %d", recorder.Code, http.StatusOK)
+		}
+		if got := recorder.Header().Values("Set-Cookie"); len(got) != 0 {
+			t.Fatalf("browser received upstream Set-Cookie: %v", got)
+		}
+	}
+
+	if got := cookieValues(requests[1].Header.Get("Cookie"), "AWSALBAPP-0"); len(got) != 1 || got[0] != "sticky" {
+		t.Fatalf("second msgstore request sticky cookies = %v, want [sticky]", got)
 	}
 }
 

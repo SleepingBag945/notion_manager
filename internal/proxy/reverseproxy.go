@@ -36,13 +36,14 @@ var reAllowedMsgstoreHost = regexp.MustCompile(`(?i)^msgstore(?:-[a-z0-9-]+)?\.(
 type ProxySession struct {
 	Account   *Account
 	CreatedAt time.Time
+	CookieJar http.CookieJar
 }
 
 // ReverseProxy proxies requests to notion.so with session/cookie injection
 type ReverseProxy struct {
-	pool      *AccountPool
-	sessions  sync.Map     // sessionID → *ProxySession
-	msgClient *http.Client // shared client for msgstore (connection reuse required)
+	pool         *AccountPool
+	sessions     sync.Map // sessionID → *ProxySession
+	msgTransport http.RoundTripper
 }
 
 // NewReverseProxy creates a reverse proxy backed by the given account pool
@@ -50,44 +51,60 @@ func NewReverseProxy(pool *AccountPool) *ReverseProxy {
 	return &ReverseProxy{
 		pool: pool,
 		// Engine.IO requires sticky sessions: AWS ALB uses AWSALBAPP-0 cookie.
-		// CookieJar stores these cookies so subsequent requests hit the same backend.
+		// Each ProxySession's CookieJar stores those cookies independently while
+		// this transport remains shared for connection reuse.
 		// DialContext routes through AppConfig.Proxy.NotionProxy at dial
 		// time so a /admin/settings flip applies to new msgstore
 		// connections without restarting the process.
-		msgClient: func() *http.Client {
-			jar, _ := cookiejar.New(nil)
-			return &http.Client{
-				Jar:           jar,
-				CheckRedirect: reverseProxyCheckRedirect(nil),
-				Transport: &http.Transport{
-					DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-						return netutil.DialThroughProxy(ctx, network, addr, AppConfig.NotionProxyURL())
-					},
-					ForceAttemptHTTP2:   false,
-					TLSNextProto:        make(map[string]func(authority string, c *tls.Conn) http.RoundTripper),
-					MaxIdleConnsPerHost: 10,
-					IdleConnTimeout:     90 * time.Second,
-				},
-			}
-		}(),
+		msgTransport: &http.Transport{
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				return netutil.DialThroughProxy(ctx, network, addr, AppConfig.NotionProxyURL())
+			},
+			ForceAttemptHTTP2:   false,
+			TLSNextProto:        make(map[string]func(authority string, c *tls.Conn) http.RoundTripper),
+			MaxIdleConnsPerHost: 10,
+			IdleConnTimeout:     90 * time.Second,
+		},
 	}
 }
 
-// accountCookieHeader returns the original full cookie when available and a
-// safely serialized minimum Notion cookie set for token-only accounts.
-func accountCookieHeader(acc *Account) string {
+func newProxySession(acc *Account) *ProxySession {
+	jar, _ := cookiejar.New(nil)
+	return &ProxySession{
+		Account:   acc,
+		CreatedAt: time.Now(),
+		CookieJar: jar,
+	}
+}
+
+var safeFullCookieSeeds = map[string]bool{
+	"notion_check_cookie_consent":  true,
+	"notion_cookie_sync_completed": true,
+	"notion_locale":                true,
+}
+
+func isTransientSessionCookie(name string) bool {
+	name = strings.ToLower(strings.TrimSpace(name))
+	return strings.Contains(name, "sync_session") || strings.HasPrefix(name, "session_sync_")
+}
+
+func parseCookieHeader(raw string) []*http.Cookie {
+	if strings.TrimSpace(raw) == "" {
+		return nil
+	}
+	req := &http.Request{Header: make(http.Header)}
+	req.Header.Set("Cookie", raw)
+	return req.Cookies()
+}
+
+func accountSeedCookies(acc *Account) []*http.Cookie {
 	if acc == nil {
-		return ""
+		return nil
 	}
 
 	acc.mu.RLock()
 	defer acc.mu.RUnlock()
 
-	if acc.FullCookie != "" {
-		return acc.FullCookie
-	}
-
-	// Fallback: set minimal required cookies
 	values := []struct {
 		name  string
 		value string
@@ -97,29 +114,87 @@ func accountCookieHeader(acc *Account) string {
 		{name: "notion_browser_id", value: acc.BrowserID},
 		{name: "device_id", value: acc.DeviceID},
 	}
-	cookies := make([]string, 0, len(values))
+	cookies := make([]*http.Cookie, 0, len(values)+len(safeFullCookieSeeds))
+	seen := make(map[string]bool, len(values)+len(safeFullCookieSeeds))
 	for _, item := range values {
 		if item.value == "" {
 			continue
 		}
-		cookies = append(cookies, (&http.Cookie{Name: item.name, Value: item.value}).String())
+		cookies = append(cookies, &http.Cookie{Name: item.name, Value: item.value})
+		seen[item.name] = true
 	}
-	return strings.Join(cookies, "; ")
+
+	// FullCookie can contain stale session-sync state. Only copy explicitly
+	// stable, non-authentication preferences; Account fields above remain the
+	// source of truth, so token_v2 and identity cookies can never be replaced.
+	for _, cookie := range parseCookieHeader(acc.FullCookie) {
+		name := strings.ToLower(cookie.Name)
+		if isTransientSessionCookie(name) || !safeFullCookieSeeds[name] || seen[name] {
+			continue
+		}
+		cookies = append(cookies, &http.Cookie{Name: cookie.Name, Value: cookie.Value})
+		seen[name] = true
+	}
+	return cookies
 }
 
-func reverseProxyHTTPClient(timeout time.Duration, acc *Account) *http.Client {
-	return newReverseProxyHTTPClient(timeout, getChromeRoundTripper(), acc)
+// accountCookieHeader returns the stable Notion cookie seed for an account.
+func accountCookieHeader(acc *Account) string {
+	cookies := accountSeedCookies(acc)
+	parts := make([]string, 0, len(cookies))
+	for _, cookie := range cookies {
+		parts = append(parts, cookie.String())
+	}
+	return strings.Join(parts, "; ")
 }
 
-func newReverseProxyHTTPClient(timeout time.Duration, transport http.RoundTripper, acc *Account) *http.Client {
+func setProxySessionCookies(req *http.Request, sess *ProxySession) {
+	req.Header.Del("Cookie")
+	jarNames := make(map[string]bool)
+	if sess != nil && sess.CookieJar != nil {
+		for _, cookie := range sess.CookieJar.Cookies(req.URL) {
+			jarNames[cookie.Name] = true
+		}
+	}
+	if sess == nil {
+		return
+	}
+	for _, cookie := range accountSeedCookies(sess.Account) {
+		if !jarNames[cookie.Name] {
+			req.AddCookie(cookie)
+		}
+	}
+}
+
+func proxySessionCookieHeader(sess *ProxySession, targetURL *url.URL) string {
+	req := &http.Request{Header: make(http.Header), URL: targetURL}
+	setProxySessionCookies(req, sess)
+	if sess != nil && sess.CookieJar != nil {
+		for _, cookie := range sess.CookieJar.Cookies(targetURL) {
+			req.AddCookie(cookie)
+		}
+	}
+	return req.Header.Get("Cookie")
+}
+
+func reverseProxyHTTPClient(timeout time.Duration, sess *ProxySession) *http.Client {
+	return newReverseProxyHTTPClient(timeout, getChromeRoundTripper(), sess)
+}
+
+func newReverseProxyHTTPClient(timeout time.Duration, transport http.RoundTripper, sess *ProxySession) *http.Client {
+	var jar http.CookieJar
+	if sess != nil {
+		jar = sess.CookieJar
+	}
 	return &http.Client{
 		Transport:     transport,
 		Timeout:       timeout,
-		CheckRedirect: reverseProxyCheckRedirect(acc),
+		Jar:           jar,
+		CheckRedirect: reverseProxyCheckRedirect(sess),
 	}
 }
 
-func reverseProxyCheckRedirect(acc *Account) func(*http.Request, []*http.Request) error {
+func reverseProxyCheckRedirect(sess *ProxySession) func(*http.Request, []*http.Request) error {
 	return func(req *http.Request, via []*http.Request) error {
 		// The standard client may copy sensitive headers before CheckRedirect.
 		// Remove Cookie first so blocked destinations can never receive it.
@@ -138,13 +213,7 @@ func reverseProxyCheckRedirect(acc *Account) func(*http.Request, []*http.Request
 		}
 
 		req.Host = req.URL.Host
-		cookie := accountCookieHeader(acc)
-		if cookie == "" && len(via) != 0 {
-			cookie = via[0].Header.Get("Cookie")
-		}
-		if cookie != "" {
-			req.Header.Set("Cookie", cookie)
-		}
+		setProxySessionCookies(req, sess)
 		return nil
 	}
 }
@@ -334,10 +403,10 @@ func (rp *ReverseProxy) proxyHTML(w http.ResponseWriter, r *http.Request, sess *
 	if al := r.Header.Get("Accept-Language"); al != "" {
 		req.Header.Set("Accept-Language", al)
 	}
-	req.Header.Set("Cookie", accountCookieHeader(sess.Account))
+	setProxySessionCookies(req, sess)
 	// Deliberately omit Accept-Encoding so we get uncompressed HTML for patching
 
-	client := reverseProxyHTTPClient(30*time.Second, sess.Account)
+	client := reverseProxyHTTPClient(30*time.Second, sess)
 	resp, err := client.Do(req)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
@@ -404,7 +473,7 @@ func (rp *ReverseProxy) proxyAPI(w http.ResponseWriter, r *http.Request, sess *P
 	}
 
 	acc := sess.Account
-	req.Header.Set("Cookie", accountCookieHeader(acc))
+	setProxySessionCookies(req, sess)
 	req.Header.Set("x-notion-active-user-header", acc.UserID)
 	req.Header.Set("x-notion-space-id", acc.SpaceID)
 	if acc.ClientVersion != "" {
@@ -414,7 +483,7 @@ func (rp *ReverseProxy) proxyAPI(w http.ResponseWriter, r *http.Request, sess *P
 	req.Header.Set("Referer", notionReferer)
 
 	// No timeout for streaming (runInferenceTranscript can stream for minutes)
-	client := reverseProxyHTTPClient(0, acc)
+	client := reverseProxyHTTPClient(0, sess)
 	resp, err := client.Do(req)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
@@ -446,9 +515,9 @@ func (rp *ReverseProxy) proxyGeneric(w http.ResponseWriter, r *http.Request, ses
 			req.Header.Add(k, v)
 		}
 	}
-	req.Header.Set("Cookie", accountCookieHeader(sess.Account))
+	setProxySessionCookies(req, sess)
 
-	client := reverseProxyHTTPClient(30*time.Second, sess.Account)
+	client := reverseProxyHTTPClient(30*time.Second, sess)
 	resp, err := client.Do(req)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
@@ -483,11 +552,11 @@ func (rp *ReverseProxy) proxyWithCookies(w http.ResponseWriter, r *http.Request,
 			req.Header.Add(k, v)
 		}
 	}
-	req.Header.Set("Cookie", accountCookieHeader(sess.Account))
+	setProxySessionCookies(req, sess)
 	req.Header.Set("Origin", notionOrigin)
 	req.Header.Set("Referer", notionReferer)
 
-	client := reverseProxyHTTPClient(0, sess.Account)
+	client := reverseProxyHTTPClient(0, sess)
 	resp, err := client.Do(req)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
@@ -625,17 +694,9 @@ func (rp *ReverseProxy) proxyWebSocket(w http.ResponseWriter, r *http.Request, s
 			buf.WriteString(fmt.Sprintf("%s: %s\r\n", k, v))
 		}
 	}
-	// Include account cookies + ALB sticky session cookies from CookieJar
-	cookieStr := accountCookieHeader(sess.Account)
-	if rp.msgClient.Jar != nil {
-		jarURL, _ := url.Parse("https://" + targetHost + targetPath)
-		for _, c := range rp.msgClient.Jar.Cookies(jarURL) {
-			if cookieStr != "" {
-				cookieStr += "; "
-			}
-			cookieStr += c.String()
-		}
-	}
+	// Include account seeds plus this proxy session's dynamic and ALB cookies.
+	jarURL, _ := url.Parse("https://" + targetHost + targetPath)
+	cookieStr := proxySessionCookieHeader(sess, jarURL)
 	buf.WriteString(fmt.Sprintf("Cookie: %s\r\n", cookieStr))
 	buf.WriteString("Origin: " + notionOrigin + "\r\n")
 	buf.WriteString("\r\n")
@@ -654,6 +715,10 @@ func (rp *ReverseProxy) proxyWebSocket(w http.ResponseWriter, r *http.Request, s
 		clientConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
 		return
 	}
+	if sess.CookieJar != nil {
+		sess.CookieJar.SetCookies(jarURL, resp.Cookies())
+	}
+	resp.Header.Del("Set-Cookie")
 	resp.Write(clientConn)
 
 	if resp.StatusCode != http.StatusSwitchingProtocols {
@@ -703,12 +768,13 @@ func (rp *ReverseProxy) proxyMsgstoreHTTP(w http.ResponseWriter, r *http.Request
 			req.Header.Add(k, v)
 		}
 	}
-	req.Header.Set("Cookie", accountCookieHeader(sess.Account))
+	setProxySessionCookies(req, sess)
 	req.Header.Set("Origin", notionOrigin)
 	req.Header.Set("Referer", notionReferer)
 
-	// Use SHARED client with CookieJar — AWS ALB sticky session requires AWSALBAPP-0 cookie
-	resp, err := rp.msgClient.Do(req)
+	// The transport is shared for connection reuse; cookies remain session-local.
+	client := newReverseProxyHTTPClient(0, rp.msgTransport, sess)
+	resp, err := client.Do(req)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return

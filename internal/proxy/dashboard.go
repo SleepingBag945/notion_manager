@@ -202,7 +202,7 @@ func (p *AccountPool) GetBestAccount() *Account {
 // CreateTargetedSession creates a proxy session for a specific account
 func (rp *ReverseProxy) CreateTargetedSession(w http.ResponseWriter, acc *Account) {
 	id := generateUUIDv4()
-	sess := &ProxySession{Account: acc, CreatedAt: time.Now()}
+	sess := newProxySession(acc)
 	rp.sessions.Store(id, sess)
 	http.SetCookie(w, &http.Cookie{
 		Name: "np_session", Value: id, Path: "/",
