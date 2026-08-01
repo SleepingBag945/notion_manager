@@ -46,7 +46,8 @@ func TestAccountCookieHeaderFallback(t *testing.T) {
 		BrowserID: "browser",
 		DeviceID:  "device",
 	}
-	want := "token_v2=token; notion_user_id=user; notion_browser_id=browser; device_id=device"
+	want := "token_v2=token; notion_user_id=user; notion_users=%5B%22user%22%5D; " +
+		"notion_browser_id=browser; device_id=device"
 	if got := accountCookieHeader(acc); got != want {
 		t.Fatalf("accountCookieHeader() = %q, want %q", got, want)
 	}
@@ -58,12 +59,12 @@ func TestAccountCookieHeaderFiltersFullCookieAndKeepsStableSeeds(t *testing.T) {
 		UserID:    "stable-user",
 		BrowserID: "stable-browser",
 		DeviceID:  "stable-device",
-		FullCookie: "token_v2=stale-token; notion_user_id=stale-user; notion_locale=zh-CN; " +
+		FullCookie: "token_v2=stale-token; notion_user_id=stale-user; notion_users=%5B%22stale-user%22%5D; notion_locale=zh-CN; " +
 			"notion_check_cookie_consent=true; sync_session=stale; sync_session_v2=stale; " +
 			"session_sync_nonce=stale; session_sync_checked=stale; custom=value",
 	}
-	want := "token_v2=stable-token; notion_user_id=stable-user; notion_browser_id=stable-browser; " +
-		"device_id=stable-device; notion_locale=zh-CN; notion_check_cookie_consent=true"
+	want := "token_v2=stable-token; notion_user_id=stable-user; notion_users=%5B%22stable-user%22%5D; " +
+		"notion_browser_id=stable-browser; device_id=stable-device; notion_locale=zh-CN; notion_check_cookie_consent=true"
 	if got := accountCookieHeader(acc); got != want {
 		t.Fatalf("accountCookieHeader() = %q, want %q", got, want)
 	}

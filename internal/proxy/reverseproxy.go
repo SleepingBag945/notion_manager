@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -111,6 +112,7 @@ func accountSeedCookies(acc *Account) []*http.Cookie {
 	}{
 		{name: "token_v2", value: acc.TokenV2},
 		{name: "notion_user_id", value: acc.UserID},
+		{name: "notion_users", value: notionUsersCookieValue(acc.UserID)},
 		{name: "notion_browser_id", value: acc.BrowserID},
 		{name: "device_id", value: acc.DeviceID},
 	}
@@ -136,6 +138,17 @@ func accountSeedCookies(acc *Account) []*http.Cookie {
 		seen[name] = true
 	}
 	return cookies
+}
+
+func notionUsersCookieValue(userID string) string {
+	if userID == "" {
+		return ""
+	}
+	users, err := json.Marshal([]string{userID})
+	if err != nil {
+		return ""
+	}
+	return url.PathEscape(string(users))
 }
 
 // accountCookieHeader returns the stable Notion cookie seed for an account.
