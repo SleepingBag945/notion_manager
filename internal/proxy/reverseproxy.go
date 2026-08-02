@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -20,24 +21,30 @@ import (
 )
 
 const (
-	notionOrigin   = "https://www.notion.so"
-	msgstoreOrigin = "https://msgstore.www.notion.so"
+	notionOrigin         = "https://app.notion.com"
+	notionReferer        = notionOrigin + "/"
+	msgstoreHost         = "msgstore.app.notion.com"
+	msgstoreOrigin       = "https://" + msgstoreHost
+	maxProxyRedirectHops = 3
 )
 
 // Strip analytics/tracking script/noscript tags from HTML
 var reAnalyticsScript = regexp.MustCompile(`(?s)<(?:script|noscript)[^>]*>.*?(?:googletagmanager\.com|customer\.io|gtag/js).*?</(?:script|noscript)>`)
 
+var reAllowedMsgstoreHost = regexp.MustCompile(`(?i)^msgstore(?:-[a-z0-9-]+)?\.(?:www\.notion\.so|app\.notion\.com)$`)
+
 // ProxySession maps a proxy session cookie to a pooled account
 type ProxySession struct {
 	Account   *Account
 	CreatedAt time.Time
+	CookieJar http.CookieJar
 }
 
 // ReverseProxy proxies requests to notion.so with session/cookie injection
 type ReverseProxy struct {
-	pool      *AccountPool
-	sessions  sync.Map     // sessionID → *ProxySession
-	msgClient *http.Client // shared client for msgstore (connection reuse required)
+	pool         *AccountPool
+	sessions     sync.Map // sessionID → *ProxySession
+	msgTransport http.RoundTripper
 }
 
 // NewReverseProxy creates a reverse proxy backed by the given account pool
@@ -45,26 +52,187 @@ func NewReverseProxy(pool *AccountPool) *ReverseProxy {
 	return &ReverseProxy{
 		pool: pool,
 		// Engine.IO requires sticky sessions: AWS ALB uses AWSALBAPP-0 cookie.
-		// CookieJar stores these cookies so subsequent requests hit the same backend.
+		// Each ProxySession's CookieJar stores those cookies independently while
+		// this transport remains shared for connection reuse.
 		// DialContext routes through AppConfig.Proxy.NotionProxy at dial
 		// time so a /admin/settings flip applies to new msgstore
 		// connections without restarting the process.
-		msgClient: func() *http.Client {
-			jar, _ := cookiejar.New(nil)
-			return &http.Client{
-				Jar: jar,
-				Transport: &http.Transport{
-					DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-						return netutil.DialThroughProxy(ctx, network, addr, AppConfig.NotionProxyURL())
-					},
-					ForceAttemptHTTP2:   false,
-					TLSNextProto:        make(map[string]func(authority string, c *tls.Conn) http.RoundTripper),
-					MaxIdleConnsPerHost: 10,
-					IdleConnTimeout:     90 * time.Second,
-				},
-			}
-		}(),
+		msgTransport: &http.Transport{
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				return netutil.DialThroughProxy(ctx, network, addr, AppConfig.NotionProxyURL())
+			},
+			ForceAttemptHTTP2:   false,
+			TLSNextProto:        make(map[string]func(authority string, c *tls.Conn) http.RoundTripper),
+			MaxIdleConnsPerHost: 10,
+			IdleConnTimeout:     90 * time.Second,
+		},
 	}
+}
+
+func newProxySession(acc *Account) *ProxySession {
+	jar, _ := cookiejar.New(nil)
+	return &ProxySession{
+		Account:   acc,
+		CreatedAt: time.Now(),
+		CookieJar: jar,
+	}
+}
+
+var safeFullCookieSeeds = map[string]bool{
+	"notion_check_cookie_consent":  true,
+	"notion_cookie_sync_completed": true,
+	"notion_locale":                true,
+}
+
+func isTransientSessionCookie(name string) bool {
+	name = strings.ToLower(strings.TrimSpace(name))
+	return strings.Contains(name, "sync_session") || strings.HasPrefix(name, "session_sync_")
+}
+
+func parseCookieHeader(raw string) []*http.Cookie {
+	if strings.TrimSpace(raw) == "" {
+		return nil
+	}
+	req := &http.Request{Header: make(http.Header)}
+	req.Header.Set("Cookie", raw)
+	return req.Cookies()
+}
+
+func accountSeedCookies(acc *Account) []*http.Cookie {
+	if acc == nil {
+		return nil
+	}
+
+	acc.mu.RLock()
+	defer acc.mu.RUnlock()
+
+	values := []struct {
+		name  string
+		value string
+	}{
+		{name: "token_v2", value: acc.TokenV2},
+		{name: "notion_user_id", value: acc.UserID},
+		{name: "notion_users", value: notionUsersCookieValue(acc.UserID)},
+		{name: "notion_browser_id", value: acc.BrowserID},
+		{name: "device_id", value: acc.DeviceID},
+	}
+	cookies := make([]*http.Cookie, 0, len(values)+len(safeFullCookieSeeds))
+	seen := make(map[string]bool, len(values)+len(safeFullCookieSeeds))
+	for _, item := range values {
+		if item.value == "" {
+			continue
+		}
+		cookies = append(cookies, &http.Cookie{Name: item.name, Value: item.value})
+		seen[item.name] = true
+	}
+
+	// FullCookie can contain stale session-sync state. Only copy explicitly
+	// stable, non-authentication preferences; Account fields above remain the
+	// source of truth, so token_v2 and identity cookies can never be replaced.
+	for _, cookie := range parseCookieHeader(acc.FullCookie) {
+		name := strings.ToLower(cookie.Name)
+		if isTransientSessionCookie(name) || !safeFullCookieSeeds[name] || seen[name] {
+			continue
+		}
+		cookies = append(cookies, &http.Cookie{Name: cookie.Name, Value: cookie.Value})
+		seen[name] = true
+	}
+	return cookies
+}
+
+func notionUsersCookieValue(userID string) string {
+	if userID == "" {
+		return ""
+	}
+	users, err := json.Marshal([]string{userID})
+	if err != nil {
+		return ""
+	}
+	return url.PathEscape(string(users))
+}
+
+// accountCookieHeader returns the stable Notion cookie seed for an account.
+func accountCookieHeader(acc *Account) string {
+	cookies := accountSeedCookies(acc)
+	parts := make([]string, 0, len(cookies))
+	for _, cookie := range cookies {
+		parts = append(parts, cookie.String())
+	}
+	return strings.Join(parts, "; ")
+}
+
+func setProxySessionCookies(req *http.Request, sess *ProxySession) {
+	req.Header.Del("Cookie")
+	jarNames := make(map[string]bool)
+	if sess != nil && sess.CookieJar != nil {
+		for _, cookie := range sess.CookieJar.Cookies(req.URL) {
+			jarNames[cookie.Name] = true
+		}
+	}
+	if sess == nil {
+		return
+	}
+	for _, cookie := range accountSeedCookies(sess.Account) {
+		if !jarNames[cookie.Name] {
+			req.AddCookie(cookie)
+		}
+	}
+}
+
+func proxySessionCookieHeader(sess *ProxySession, targetURL *url.URL) string {
+	req := &http.Request{Header: make(http.Header), URL: targetURL}
+	setProxySessionCookies(req, sess)
+	if sess != nil && sess.CookieJar != nil {
+		for _, cookie := range sess.CookieJar.Cookies(targetURL) {
+			req.AddCookie(cookie)
+		}
+	}
+	return req.Header.Get("Cookie")
+}
+
+func reverseProxyHTTPClient(timeout time.Duration, sess *ProxySession) *http.Client {
+	return newReverseProxyHTTPClient(timeout, getChromeRoundTripper(), sess)
+}
+
+func newReverseProxyHTTPClient(timeout time.Duration, transport http.RoundTripper, sess *ProxySession) *http.Client {
+	var jar http.CookieJar
+	if sess != nil {
+		jar = sess.CookieJar
+	}
+	return &http.Client{
+		Transport:     transport,
+		Timeout:       timeout,
+		Jar:           jar,
+		CheckRedirect: reverseProxyCheckRedirect(sess),
+	}
+}
+
+func reverseProxyCheckRedirect(sess *ProxySession) func(*http.Request, []*http.Request) error {
+	return func(req *http.Request, via []*http.Request) error {
+		// The standard client may copy sensitive headers before CheckRedirect.
+		// Remove Cookie first so blocked destinations can never receive it.
+		req.Header.Del("Cookie")
+
+		if len(via) > maxProxyRedirectHops {
+			return fmt.Errorf("reverse proxy redirect limit exceeded: %d hops", maxProxyRedirectHops)
+		}
+		if req.URL.Scheme != "https" || !isAllowedNotionRedirectHost(req.URL.Hostname()) {
+			return fmt.Errorf("reverse proxy redirect blocked: %s", req.URL.Redacted())
+		}
+		for _, previous := range via {
+			if previous.URL.String() == req.URL.String() {
+				return fmt.Errorf("reverse proxy redirect loop blocked: %s", req.URL.Redacted())
+			}
+		}
+
+		req.Host = req.URL.Host
+		setProxySessionCookies(req, sess)
+		return nil
+	}
+}
+
+func isAllowedNotionRedirectHost(host string) bool {
+	return strings.EqualFold(host, "www.notion.so") || strings.EqualFold(host, "app.notion.com")
 }
 
 // getSession retrieves an existing session for the request.
@@ -86,22 +254,11 @@ func (rp *ReverseProxy) getSession(r *http.Request) *ProxySession {
 func configPatchScript(origin string, acc *Account) string {
 	// Build cookie-setting JS from full_cookie string
 	cookieJS := ""
-	if acc.FullCookie != "" {
-		for _, part := range strings.Split(acc.FullCookie, "; ") {
-			part = strings.TrimSpace(part)
-			if part != "" {
-				cookieJS += fmt.Sprintf(`document.cookie=%q+";path=/";`, part)
-			}
+	for _, part := range strings.Split(accountCookieHeader(acc), ";") {
+		part = strings.TrimSpace(part)
+		if part != "" {
+			cookieJS += fmt.Sprintf(`document.cookie=%q+";path=/";`, part)
 		}
-	} else {
-		// Fallback: set minimal required cookies
-		cookieJS = fmt.Sprintf(
-			`document.cookie="token_v2=%s;path=/";`+
-				`document.cookie="notion_user_id=%s;path=/";`+
-				`document.cookie="notion_browser_id=%s;path=/";`+
-				`document.cookie="device_id=%s;path=/";`,
-			acc.TokenV2, acc.UserID, acc.BrowserID, acc.DeviceID,
-		)
 	}
 
 	return fmt.Sprintf(`<script>(function(){`+
@@ -121,8 +278,8 @@ func configPatchScript(origin string, acc *Account) string {
 		`if(navigator.serviceWorker)navigator.serviceWorker.getRegistrations()`+
 		`.then(function(r){r.forEach(function(x){x.unregister()})});`+
 		// Step 4: Intercept fetch/XHR/WebSocket for msgstore URLs
-		`var re=/https?:\/\/(msgstore[^\/]*\.www\.notion\.so)/;`+
-		`var wre=/wss?:\/\/(msgstore[^\/]*\.www\.notion\.so)/;`+
+		`var re=/https?:\/\/(msgstore[^\/]*\.(?:www\.notion\.so|app\.notion\.com))/;`+
+		`var wre=/wss?:\/\/(msgstore[^\/]*\.(?:www\.notion\.so|app\.notion\.com))/;`+
 		`var _bk=/googletagmanager\.com|customer\.io|app\.notion\.com\/exp|splunkcloud\.com|amplitude\.com/;`+
 		`var _f=window.fetch;`+
 		`window.fetch=function(u,i){`+
@@ -200,7 +357,7 @@ func (rp *ReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// MessageStore proxy (real-time sync)
 	// Primus strips path from messageStore.url and uses origin + /primus-v8/
 	if strings.HasPrefix(path, "/primus-v8/") || strings.HasPrefix(path, "/msgstore/") {
-		targetHost := "msgstore.www.notion.so"
+		targetHost := msgstoreHost
 		targetPath := path
 		if strings.HasPrefix(path, "/msgstore/") {
 			targetPath = strings.TrimPrefix(path, "/msgstore")
@@ -259,10 +416,10 @@ func (rp *ReverseProxy) proxyHTML(w http.ResponseWriter, r *http.Request, sess *
 	if al := r.Header.Get("Accept-Language"); al != "" {
 		req.Header.Set("Accept-Language", al)
 	}
-	req.Header.Set("Cookie", sess.Account.FullCookie)
+	setProxySessionCookies(req, sess)
 	// Deliberately omit Accept-Encoding so we get uncompressed HTML for patching
 
-	client := getChromeHTTPClient(30 * time.Second)
+	client := reverseProxyHTTPClient(30*time.Second, sess)
 	resp, err := client.Do(req)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
@@ -329,17 +486,17 @@ func (rp *ReverseProxy) proxyAPI(w http.ResponseWriter, r *http.Request, sess *P
 	}
 
 	acc := sess.Account
-	req.Header.Set("Cookie", acc.FullCookie)
+	setProxySessionCookies(req, sess)
 	req.Header.Set("x-notion-active-user-header", acc.UserID)
 	req.Header.Set("x-notion-space-id", acc.SpaceID)
 	if acc.ClientVersion != "" {
 		req.Header.Set("notion-client-version", acc.ClientVersion)
 	}
-	req.Header.Set("Origin", "https://www.notion.so")
-	req.Header.Set("Referer", "https://www.notion.so/")
+	req.Header.Set("Origin", notionOrigin)
+	req.Header.Set("Referer", notionReferer)
 
 	// No timeout for streaming (runInferenceTranscript can stream for minutes)
-	client := getChromeHTTPClient(0)
+	client := reverseProxyHTTPClient(0, sess)
 	resp, err := client.Do(req)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
@@ -371,9 +528,9 @@ func (rp *ReverseProxy) proxyGeneric(w http.ResponseWriter, r *http.Request, ses
 			req.Header.Add(k, v)
 		}
 	}
-	req.Header.Set("Cookie", sess.Account.FullCookie)
+	setProxySessionCookies(req, sess)
 
-	client := getChromeHTTPClient(30 * time.Second)
+	client := reverseProxyHTTPClient(30*time.Second, sess)
 	resp, err := client.Do(req)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
@@ -408,11 +565,11 @@ func (rp *ReverseProxy) proxyWithCookies(w http.ResponseWriter, r *http.Request,
 			req.Header.Add(k, v)
 		}
 	}
-	req.Header.Set("Cookie", sess.Account.FullCookie)
-	req.Header.Set("Origin", "https://www.notion.so")
-	req.Header.Set("Referer", "https://www.notion.so/")
+	setProxySessionCookies(req, sess)
+	req.Header.Set("Origin", notionOrigin)
+	req.Header.Set("Referer", notionReferer)
 
-	client := getChromeHTTPClient(0)
+	client := reverseProxyHTTPClient(0, sess)
 	resp, err := client.Do(req)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
@@ -486,8 +643,17 @@ func isWebSocketUpgrade(r *http.Request) bool {
 	return strings.EqualFold(r.Header.Get("Upgrade"), "websocket")
 }
 
+func isAllowedMsgstoreHost(host string) bool {
+	return reAllowedMsgstoreHost.MatchString(host)
+}
+
 // proxyWebSocket does TCP-level WebSocket proxying via HTTP hijack
 func (rp *ReverseProxy) proxyWebSocket(w http.ResponseWriter, r *http.Request, sess *ProxySession, targetHost, targetPath string) {
+	if !isAllowedMsgstoreHost(targetHost) {
+		http.Error(w, "invalid msgstore host", http.StatusBadRequest)
+		return
+	}
+
 	hj, ok := w.(http.Hijacker)
 	if !ok {
 		http.Error(w, "websocket not supported", http.StatusInternalServerError)
@@ -541,16 +707,11 @@ func (rp *ReverseProxy) proxyWebSocket(w http.ResponseWriter, r *http.Request, s
 			buf.WriteString(fmt.Sprintf("%s: %s\r\n", k, v))
 		}
 	}
-	// Include account cookies + ALB sticky session cookies from CookieJar
-	cookieStr := sess.Account.FullCookie
-	if rp.msgClient.Jar != nil {
-		jarURL, _ := url.Parse("https://" + targetHost + targetPath)
-		for _, c := range rp.msgClient.Jar.Cookies(jarURL) {
-			cookieStr += "; " + c.Name + "=" + c.Value
-		}
-	}
+	// Include account seeds plus this proxy session's dynamic and ALB cookies.
+	jarURL, _ := url.Parse("https://" + targetHost + targetPath)
+	cookieStr := proxySessionCookieHeader(sess, jarURL)
 	buf.WriteString(fmt.Sprintf("Cookie: %s\r\n", cookieStr))
-	buf.WriteString("Origin: https://www.notion.so\r\n")
+	buf.WriteString("Origin: " + notionOrigin + "\r\n")
 	buf.WriteString("\r\n")
 
 	if _, err := targetConn.Write([]byte(buf.String())); err != nil {
@@ -567,6 +728,10 @@ func (rp *ReverseProxy) proxyWebSocket(w http.ResponseWriter, r *http.Request, s
 		clientConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
 		return
 	}
+	if sess.CookieJar != nil {
+		sess.CookieJar.SetCookies(jarURL, resp.Cookies())
+	}
+	resp.Header.Del("Set-Cookie")
 	resp.Write(clientConn)
 
 	if resp.StatusCode != http.StatusSwitchingProtocols {
@@ -591,6 +756,11 @@ func (rp *ReverseProxy) proxyWebSocket(w http.ResponseWriter, r *http.Request, s
 
 // proxyMsgstoreHTTP proxies msgstore HTTP requests using the shared persistent client
 func (rp *ReverseProxy) proxyMsgstoreHTTP(w http.ResponseWriter, r *http.Request, sess *ProxySession, targetHost, targetPath string) {
+	if !isAllowedMsgstoreHost(targetHost) {
+		http.Error(w, "invalid msgstore host", http.StatusBadRequest)
+		return
+	}
+
 	targetURL := "https://" + targetHost + targetPath
 	if r.URL.RawQuery != "" {
 		targetURL += "?" + r.URL.RawQuery
@@ -611,12 +781,13 @@ func (rp *ReverseProxy) proxyMsgstoreHTTP(w http.ResponseWriter, r *http.Request
 			req.Header.Add(k, v)
 		}
 	}
-	req.Header.Set("Cookie", sess.Account.FullCookie)
-	req.Header.Set("Origin", "https://www.notion.so")
-	req.Header.Set("Referer", "https://www.notion.so/")
+	setProxySessionCookies(req, sess)
+	req.Header.Set("Origin", notionOrigin)
+	req.Header.Set("Referer", notionReferer)
 
-	// Use SHARED client with CookieJar — AWS ALB sticky session requires AWSALBAPP-0 cookie
-	resp, err := rp.msgClient.Do(req)
+	// The transport is shared for connection reuse; cookies remain session-local.
+	client := newReverseProxyHTTPClient(0, rp.msgTransport, sess)
+	resp, err := client.Do(req)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
