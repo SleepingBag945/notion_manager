@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -37,12 +38,19 @@ type OpenAIFunctionDefinition struct {
 }
 
 type OpenAITool struct {
-	Type        string                    `json:"type"`
-	Name        string                    `json:"name,omitempty"`
-	Description string                    `json:"description,omitempty"`
-	Parameters  interface{}               `json:"parameters,omitempty"`
-	Strict      bool                      `json:"strict,omitempty"`
-	Function    *OpenAIFunctionDefinition `json:"function,omitempty"`
+	Type         string                    `json:"type"`
+	Name         string                    `json:"name,omitempty"`
+	Description  string                    `json:"description,omitempty"`
+	Parameters   interface{}               `json:"parameters,omitempty"`
+	Strict       bool                      `json:"strict,omitempty"`
+	Function     *OpenAIFunctionDefinition `json:"function,omitempty"`
+	Tools        []OpenAITool              `json:"tools,omitempty"`
+	DeferLoading bool                      `json:"defer_loading,omitempty"`
+}
+
+type openAIToolIdentity struct {
+	Namespace string
+	Name      string
 }
 
 type OpenAIChatToolCallFunction struct {
@@ -398,6 +406,7 @@ type responsesStreamToolItem struct {
 	OutputIndex int
 	CallID      string
 	Name        string
+	Namespace   string
 	Arguments   strings.Builder
 	Done        bool
 }
@@ -419,6 +428,7 @@ type openAIResponsesStreamTranscoder struct {
 	messageText     strings.Builder
 	toolBlocks      map[int]*responsesStreamToolItem
 	toolItems       []*responsesStreamToolItem
+	toolAliases     map[string]openAIToolIdentity
 	// Reasoning (thinking) state
 	reasoningStarted bool
 	reasoningItemID  string
@@ -427,8 +437,8 @@ type openAIResponsesStreamTranscoder struct {
 	thinkingBlocks   map[int]bool // Anthropic block index → is thinking block
 }
 
-func newOpenAIResponsesStreamTranscoder(w http.ResponseWriter, flusher http.Flusher, responseID, model string, created int64) *openAIResponsesStreamTranscoder {
-	return &openAIResponsesStreamTranscoder{
+func newOpenAIResponsesStreamTranscoder(w http.ResponseWriter, flusher http.Flusher, responseID, model string, created int64, aliases ...map[string]openAIToolIdentity) *openAIResponsesStreamTranscoder {
+	transcoder := &openAIResponsesStreamTranscoder{
 		w:              w,
 		flusher:        flusher,
 		responseID:     responseID,
@@ -437,6 +447,44 @@ func newOpenAIResponsesStreamTranscoder(w http.ResponseWriter, flusher http.Flus
 		toolBlocks:     make(map[int]*responsesStreamToolItem),
 		thinkingBlocks: make(map[int]bool),
 	}
+	if len(aliases) > 0 {
+		transcoder.toolAliases = aliases[0]
+	}
+	return transcoder
+}
+
+func resolveOpenAIToolIdentity(alias string, aliases map[string]openAIToolIdentity) openAIToolIdentity {
+	if identity, ok := aliases[alias]; ok {
+		return identity
+	}
+	return openAIToolIdentity{Name: alias}
+}
+
+func resolveOpenAIToolAlias(namespace, name string, aliases map[string]openAIToolIdentity) (string, error) {
+	if namespace == "" {
+		return name, nil
+	}
+	for alias, identity := range aliases {
+		if identity.Namespace == namespace && identity.Name == name {
+			return alias, nil
+		}
+	}
+	return "", fmt.Errorf("unknown tool %q in namespace %q", name, namespace)
+}
+
+func openAIResponsesFunctionCallItem(itemID, status, callID string, identity openAIToolIdentity, arguments string) map[string]interface{} {
+	item := map[string]interface{}{
+		"id":        itemID,
+		"type":      "function_call",
+		"status":    status,
+		"call_id":   callID,
+		"name":      identity.Name,
+		"arguments": arguments,
+	}
+	if identity.Namespace != "" {
+		item["namespace"] = identity.Namespace
+	}
+	return item
 }
 
 func (t *openAIResponsesStreamTranscoder) emit(eventType string, payload map[string]interface{}) error {
@@ -534,14 +582,13 @@ func (t *openAIResponsesStreamTranscoder) buildFinalResponseObject() map[string]
 		})
 	}
 	for _, item := range t.toolItems {
-		output = append(output, map[string]interface{}{
-			"id":        item.ItemID,
-			"type":      "function_call",
-			"status":    "completed",
-			"call_id":   item.CallID,
-			"name":      item.Name,
-			"arguments": item.Arguments.String(),
-		})
+		output = append(output, openAIResponsesFunctionCallItem(
+			item.ItemID,
+			"completed",
+			item.CallID,
+			openAIToolIdentity{Namespace: item.Namespace, Name: item.Name},
+			item.Arguments.String(),
+		))
 	}
 	return map[string]interface{}{
 		"id":         t.responseID,
@@ -616,14 +663,13 @@ func (t *openAIResponsesStreamTranscoder) finalizeToolItem(index int) error {
 	return t.emit("response.output_item.done", map[string]interface{}{
 		"response_id":  t.responseID,
 		"output_index": item.OutputIndex,
-		"item": map[string]interface{}{
-			"id":        item.ItemID,
-			"type":      "function_call",
-			"status":    "completed",
-			"call_id":   item.CallID,
-			"name":      item.Name,
-			"arguments": item.Arguments.String(),
-		},
+		"item": openAIResponsesFunctionCallItem(
+			item.ItemID,
+			"completed",
+			item.CallID,
+			openAIToolIdentity{Namespace: item.Namespace, Name: item.Name},
+			item.Arguments.String(),
+		),
 	})
 }
 
@@ -717,11 +763,13 @@ func (t *openAIResponsesStreamTranscoder) HandleFrame(frame anthropicSSEFrame) e
 			return nil
 		}
 		if blockType == "tool_use" {
+			identity := resolveOpenAIToolIdentity(stringValue(block["name"]), t.toolAliases)
 			item := &responsesStreamToolItem{
 				ItemID:      "fc_" + compactUUID(),
 				OutputIndex: t.nextOutputIndex,
 				CallID:      stringValue(block["id"]),
-				Name:        stringValue(block["name"]),
+				Name:        identity.Name,
+				Namespace:   identity.Namespace,
 			}
 			t.nextOutputIndex++
 			t.toolBlocks[index] = item
@@ -729,14 +777,13 @@ func (t *openAIResponsesStreamTranscoder) HandleFrame(frame anthropicSSEFrame) e
 			return t.emit("response.output_item.added", map[string]interface{}{
 				"response_id":  t.responseID,
 				"output_index": item.OutputIndex,
-				"item": map[string]interface{}{
-					"id":        item.ItemID,
-					"type":      "function_call",
-					"status":    "in_progress",
-					"call_id":   item.CallID,
-					"name":      item.Name,
-					"arguments": "",
-				},
+				"item": openAIResponsesFunctionCallItem(
+					item.ItemID,
+					"in_progress",
+					item.CallID,
+					openAIToolIdentity{Namespace: item.Namespace, Name: item.Name},
+					"",
+				),
 			})
 		}
 	case "content_block_delta":
@@ -893,7 +940,7 @@ func HandleOpenAIResponses(pool *AccountPool) http.HandlerFunc {
 			writeOpenAIError(w, http.StatusBadRequest, "invalid request body: "+err.Error(), "invalid_request_error", "")
 			return
 		}
-		anthReq, err := convertOpenAIResponsesRequest(&req)
+		anthReq, toolAliases, err := convertOpenAIResponsesRequestWithToolAliases(&req)
 		if err != nil {
 			writeOpenAIError(w, http.StatusBadRequest, err.Error(), "invalid_request_error", "")
 			return
@@ -902,7 +949,7 @@ func HandleOpenAIResponses(pool *AccountPool) http.HandlerFunc {
 		respID := "resp_" + compactUUID()
 		created := time.Now().Unix()
 		if req.Stream {
-			streamAnthropicAsOpenAIResponses(w, r, anthropicHandler, anthReq, respID, created)
+			streamAnthropicAsOpenAIResponses(w, r, anthropicHandler, anthReq, respID, created, toolAliases)
 			return
 		}
 
@@ -912,7 +959,7 @@ func HandleOpenAIResponses(pool *AccountPool) http.HandlerFunc {
 			return
 		}
 
-		resp := buildOpenAIResponsesResponse(respID, created, anthReq.Model, anthResp)
+		resp := buildOpenAIResponsesResponse(respID, created, anthReq.Model, anthResp, toolAliases)
 		LogAPIOutputJSON(respID, "openai responses response", resp)
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(resp)
@@ -969,7 +1016,7 @@ func streamAnthropicAsOpenAIChat(w http.ResponseWriter, r *http.Request, anthrop
 	}
 }
 
-func streamAnthropicAsOpenAIResponses(w http.ResponseWriter, r *http.Request, anthropicHandler http.HandlerFunc, anthropicReq *AnthropicRequest, responseID string, created int64) {
+func streamAnthropicAsOpenAIResponses(w http.ResponseWriter, r *http.Request, anthropicHandler http.HandlerFunc, anthropicReq *AnthropicRequest, responseID string, created int64, toolAliases map[string]openAIToolIdentity) {
 	bridge := newAnthropicStreamBridgeWriter()
 	innerReq, err := newAnthropicBridgeRequest(r, anthropicReq)
 	if err != nil {
@@ -986,7 +1033,7 @@ func streamAnthropicAsOpenAIResponses(w http.ResponseWriter, r *http.Request, an
 		writeOpenAIError(w, http.StatusInternalServerError, "streaming not supported", "api_error", "")
 		return
 	}
-	transcoder := newOpenAIResponsesStreamTranscoder(w, flusher, responseID, anthropicReq.Model, created)
+	transcoder := newOpenAIResponsesStreamTranscoder(w, flusher, responseID, anthropicReq.Model, created, toolAliases)
 	headersSent := false
 	frameCount := 0
 	for raw := range bridge.frames {
@@ -1163,8 +1210,12 @@ func buildOpenAIChatCompletionResponse(responseID string, created int64, model s
 	return resp
 }
 
-func buildOpenAIResponsesResponse(responseID string, created int64, model string, anthResp *AnthropicResponse) map[string]interface{} {
+func buildOpenAIResponsesResponse(responseID string, created int64, model string, anthResp *AnthropicResponse, aliasMaps ...map[string]openAIToolIdentity) map[string]interface{} {
 	text, toolCalls := extractAnthropicTextAndToolCalls(anthResp.Content)
+	var toolAliases map[string]openAIToolIdentity
+	if len(aliasMaps) > 0 {
+		toolAliases = aliasMaps[0]
+	}
 	output := make([]map[string]interface{}, 0, 1+len(toolCalls))
 	if text != "" || len(toolCalls) == 0 {
 		output = append(output, map[string]interface{}{
@@ -1180,14 +1231,13 @@ func buildOpenAIResponsesResponse(responseID string, created int64, model string
 		})
 	}
 	for _, toolCall := range toolCalls {
-		output = append(output, map[string]interface{}{
-			"id":        "fc_" + compactUUID(),
-			"type":      "function_call",
-			"status":    "completed",
-			"call_id":   toolCall.ID,
-			"name":      toolCall.Function.Name,
-			"arguments": toolCall.Function.Arguments,
-		})
+		output = append(output, openAIResponsesFunctionCallItem(
+			"fc_"+compactUUID(),
+			"completed",
+			toolCall.ID,
+			resolveOpenAIToolIdentity(toolCall.Function.Name, toolAliases),
+			toolCall.Function.Arguments,
+		))
 	}
 	resp := map[string]interface{}{
 		"id":         responseID,
@@ -1264,23 +1314,32 @@ func convertOpenAIChatCompletionRequest(req *OpenAIChatCompletionRequest) (*Anth
 }
 
 func convertOpenAIResponsesRequest(req *OpenAIResponsesRequest) (*AnthropicRequest, error) {
+	anthReq, _, err := convertOpenAIResponsesRequestWithToolAliases(req)
+	return anthReq, err
+}
+
+func convertOpenAIResponsesRequestWithToolAliases(req *OpenAIResponsesRequest) (*AnthropicRequest, map[string]openAIToolIdentity, error) {
 	if strings.TrimSpace(req.PreviousResponseID) != "" {
-		return nil, fmt.Errorf("previous_response_id is not supported in this stateless Responses bridge")
+		return nil, nil, fmt.Errorf("previous_response_id is not supported in this stateless Responses bridge")
 	}
 	model := strings.TrimSpace(req.Model)
 	if model == "" {
 		model = AppConfig.Proxy.DefaultModel
 	}
-	tools, err := convertOpenAITools(req.Tools, nil)
+	toolConversion, err := convertOpenAIToolsWithAliases(req.Tools, nil)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	system, messages, err := convertOpenAIResponsesInputToAnthropic(req.Instructions, req.Input)
+	toolChoice, err := normalizeOpenAIResponsesToolChoice(req.ToolChoice, toolConversion.Aliases)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
+	}
+	system, messages, err := convertOpenAIResponsesInputToAnthropic(req.Instructions, req.Input, toolConversion.Aliases)
+	if err != nil {
+		return nil, nil, err
 	}
 	if len(messages) == 0 {
-		return nil, fmt.Errorf("input is required")
+		return nil, nil, fmt.Errorf("input is required")
 	}
 	return &AnthropicRequest{
 		Model:        model,
@@ -1290,11 +1349,11 @@ func convertOpenAIResponsesRequest(req *OpenAIResponsesRequest) (*AnthropicReque
 		Stream:       req.Stream,
 		Temperature:  req.Temperature,
 		TopP:         req.TopP,
-		Tools:        tools,
-		ToolChoice:   req.ToolChoice,
+		Tools:        toolConversion.Tools,
+		ToolChoice:   toolChoice,
 		OutputConfig: convertOpenAIResponsesTextFormat(req.Text),
 		Metadata:     openAIMetadataWithPromptCacheKey(req.Metadata, req.PromptCacheKey),
-	}, nil
+	}, toolConversion.Aliases, nil
 }
 
 func openAIMetadataWithPromptCacheKey(metadata map[string]interface{}, promptCacheKey string) map[string]interface{} {
@@ -1312,44 +1371,229 @@ func openAIMetadataWithPromptCacheKey(metadata map[string]interface{}, promptCac
 }
 
 func convertOpenAITools(tools []OpenAITool, functions []OpenAIFunctionDefinition) ([]AnthropicTool, error) {
-	if len(tools) == 0 && len(functions) == 0 {
-		return nil, nil
+	for _, tool := range tools {
+		if tool.Type == "namespace" {
+			return nil, fmt.Errorf("unsupported tool type %q for Chat Completions", tool.Type)
+		}
 	}
-	var anthropicTools []AnthropicTool
+	conversion, err := convertOpenAIToolsWithAliases(tools, functions)
+	return conversion.Tools, err
+}
+
+type openAIToolConversion struct {
+	Tools   []AnthropicTool
+	Aliases map[string]openAIToolIdentity
+}
+
+func convertOpenAIToolsWithAliases(tools []OpenAITool, functions []OpenAIFunctionDefinition) (openAIToolConversion, error) {
+	var conversion openAIToolConversion
+	if len(tools) == 0 && len(functions) == 0 {
+		return conversion, nil
+	}
 	if len(tools) == 0 {
 		for _, fn := range functions {
-			anthropicTools = append(anthropicTools, AnthropicTool{
-				Name:        fn.Name,
+			name := strings.TrimSpace(fn.Name)
+			if name == "" {
+				return conversion, fmt.Errorf("function.name is required")
+			}
+			conversion.Tools = append(conversion.Tools, AnthropicTool{
+				Name:        name,
 				Description: fn.Description,
 				InputSchema: ensureJSONSchemaObject(fn.Parameters),
 			})
 		}
-		return anthropicTools, nil
+		return conversion, nil
 	}
+
+	// Reserve all direct names before generating aliases so a namespace tool can
+	// never hide or replace a direct function that appears later in the request.
+	directNames := make(map[string]struct{})
 	for _, tool := range tools {
 		switch tool.Type {
 		case "function":
-			fn := tool.Function
-			if fn == nil {
-				fn = &OpenAIFunctionDefinition{
-					Name:        tool.Name,
-					Description: tool.Description,
-					Parameters:  tool.Parameters,
-				}
+			fn := openAIFunctionFromTool(tool)
+			name := strings.TrimSpace(fn.Name)
+			if name == "" {
+				return conversion, fmt.Errorf("tool.function.name is required")
 			}
-			if strings.TrimSpace(fn.Name) == "" {
-				return nil, fmt.Errorf("tool.function.name is required")
+			if _, exists := directNames[name]; exists {
+				return conversion, fmt.Errorf("duplicate tool name %q", name)
 			}
-			anthropicTools = append(anthropicTools, AnthropicTool{
-				Name:        fn.Name,
+			directNames[name] = struct{}{}
+		case "web_search":
+			if _, exists := directNames["WebSearch"]; exists {
+				return conversion, fmt.Errorf("duplicate tool name %q", "WebSearch")
+			}
+			directNames["WebSearch"] = struct{}{}
+		}
+	}
+
+	usedAliases := make(map[string]struct{}, len(directNames))
+	for name := range directNames {
+		usedAliases[name] = struct{}{}
+	}
+	seenNamespaceTools := make(map[string]struct{})
+	conversion.Aliases = make(map[string]openAIToolIdentity)
+
+	for _, tool := range tools {
+		switch tool.Type {
+		case "function":
+			fn := openAIFunctionFromTool(tool)
+			conversion.Tools = append(conversion.Tools, AnthropicTool{
+				Name:        strings.TrimSpace(fn.Name),
 				Description: fn.Description,
 				InputSchema: ensureJSONSchemaObject(fn.Parameters),
 			})
+		case "namespace":
+			namespace := strings.TrimSpace(tool.Name)
+			if namespace == "" {
+				return conversion, fmt.Errorf("namespace.name is required")
+			}
+			for _, child := range tool.Tools {
+				if child.Type != "function" {
+					return conversion, fmt.Errorf("unsupported tool type %q in namespace %q", child.Type, namespace)
+				}
+				fn := openAIFunctionFromTool(child)
+				name := strings.TrimSpace(fn.Name)
+				if name == "" {
+					return conversion, fmt.Errorf("namespace %q tool.function.name is required", namespace)
+				}
+				identityKey := namespace + "\x00" + name
+				if _, exists := seenNamespaceTools[identityKey]; exists {
+					return conversion, fmt.Errorf("duplicate tool %q in namespace %q", name, namespace)
+				}
+				seenNamespaceTools[identityKey] = struct{}{}
+				alias := makeOpenAINamespaceToolAlias(namespace, name, usedAliases)
+				usedAliases[alias] = struct{}{}
+				conversion.Aliases[alias] = openAIToolIdentity{Namespace: namespace, Name: name}
+				conversion.Tools = append(conversion.Tools, AnthropicTool{
+					Name:        alias,
+					Description: mergeOpenAINamespaceToolDescription(tool.Description, fn.Description),
+					InputSchema: ensureJSONSchemaObject(fn.Parameters),
+				})
+			}
+		case "web_search":
+			conversion.Tools = append(conversion.Tools, AnthropicTool{
+				Name:        "WebSearch",
+				Description: "Search the web for current information.",
+				InputSchema: map[string]interface{}{
+					"type": "object",
+					"properties": map[string]interface{}{
+						"query": map[string]interface{}{"type": "string"},
+					},
+					"required":             []string{"query"},
+					"additionalProperties": false,
+				},
+			})
 		default:
-			return nil, fmt.Errorf("unsupported tool type %q", tool.Type)
+			return conversion, fmt.Errorf("unsupported tool type %q", tool.Type)
 		}
 	}
-	return anthropicTools, nil
+	if len(conversion.Aliases) == 0 {
+		conversion.Aliases = nil
+	}
+	return conversion, nil
+}
+
+func openAIFunctionFromTool(tool OpenAITool) OpenAIFunctionDefinition {
+	if tool.Function != nil {
+		return *tool.Function
+	}
+	return OpenAIFunctionDefinition{
+		Name:        tool.Name,
+		Description: tool.Description,
+		Parameters:  tool.Parameters,
+		Strict:      tool.Strict,
+	}
+}
+
+func mergeOpenAINamespaceToolDescription(namespaceDescription, toolDescription string) string {
+	namespaceDescription = strings.TrimSpace(namespaceDescription)
+	toolDescription = strings.TrimSpace(toolDescription)
+	if namespaceDescription == "" {
+		return toolDescription
+	}
+	if toolDescription == "" {
+		return namespaceDescription
+	}
+	return namespaceDescription + "\n\n" + toolDescription
+}
+
+func makeOpenAINamespaceToolAlias(namespace, name string, used map[string]struct{}) string {
+	sum := sha256.Sum256([]byte(namespace + "\x00" + name))
+	hashSuffix := fmt.Sprintf("_%x", sum[:6])
+	stem := "ns_" + sanitizeOpenAIToolAliasPart(namespace) + "_" + sanitizeOpenAIToolAliasPart(name)
+	fit := func(extra string) string {
+		maxStem := 64 - len(hashSuffix) - len(extra)
+		trimmedStem := stem
+		if len(trimmedStem) > maxStem {
+			trimmedStem = trimmedStem[:maxStem]
+		}
+		return trimmedStem + hashSuffix + extra
+	}
+	alias := fit("")
+	for suffix := 2; ; suffix++ {
+		if _, exists := used[alias]; !exists {
+			return alias
+		}
+		alias = fit(fmt.Sprintf("_%d", suffix))
+	}
+}
+
+func sanitizeOpenAIToolAliasPart(value string) string {
+	var sanitized strings.Builder
+	for _, char := range value {
+		switch {
+		case char >= 'a' && char <= 'z', char >= 'A' && char <= 'Z', char >= '0' && char <= '9', char == '_', char == '-':
+			sanitized.WriteRune(char)
+		default:
+			sanitized.WriteByte('_')
+		}
+	}
+	result := strings.Trim(sanitized.String(), "_")
+	if result == "" {
+		return "tool"
+	}
+	return result
+}
+
+func normalizeOpenAIResponsesToolChoice(toolChoice interface{}, aliases map[string]openAIToolIdentity) (interface{}, error) {
+	choice, ok := toolChoice.(map[string]interface{})
+	if !ok {
+		return toolChoice, nil
+	}
+	choiceType := stringValue(choice["type"])
+	if choiceType == "namespace" {
+		return nil, fmt.Errorf("tool_choice type namespace is not supported; choose a function within the namespace")
+	}
+
+	name := stringValue(choice["name"])
+	namespace := stringValue(choice["namespace"])
+	if function, ok := choice["function"].(map[string]interface{}); ok {
+		if name == "" {
+			name = stringValue(function["name"])
+		}
+		if namespace == "" {
+			namespace = stringValue(function["namespace"])
+		}
+	}
+	if namespace != "" {
+		if name == "" {
+			return nil, fmt.Errorf("namespaced tool_choice.name is required")
+		}
+		alias, err := resolveOpenAIToolAlias(namespace, name, aliases)
+		if err != nil {
+			return nil, fmt.Errorf("tool_choice references %w", err)
+		}
+		return map[string]interface{}{"type": "tool", "name": alias}, nil
+	}
+	if choiceType == "function" {
+		if name == "" {
+			return nil, fmt.Errorf("tool_choice.name is required")
+		}
+		return map[string]interface{}{"type": "tool", "name": name}, nil
+	}
+	return toolChoice, nil
 }
 
 func normalizeOpenAIToolChoice(toolChoice interface{}, functionCall interface{}) interface{} {
@@ -1416,7 +1660,7 @@ func convertOpenAIChatMessagesToAnthropic(messages []OpenAIChatMessage) (interfa
 	return system, anthropicMsgs, nil
 }
 
-func convertOpenAIResponsesInputToAnthropic(instructions string, input interface{}) (interface{}, []AnthropicMessage, error) {
+func convertOpenAIResponsesInputToAnthropic(instructions string, input interface{}, aliases map[string]openAIToolIdentity) (interface{}, []AnthropicMessage, error) {
 	var systemParts []string
 	if trimmed := strings.TrimSpace(instructions); trimmed != "" {
 		systemParts = append(systemParts, trimmed)
@@ -1432,7 +1676,7 @@ func convertOpenAIResponsesInputToAnthropic(instructions string, input interface
 	case string:
 		anthropicMsgs = append(anthropicMsgs, AnthropicMessage{Role: "user", Content: v})
 	case map[string]interface{}:
-		return convertOpenAIResponsesInputToAnthropic(instructions, []interface{}{v})
+		return convertOpenAIResponsesInputToAnthropic(instructions, []interface{}{v}, aliases)
 	case []interface{}:
 		var pendingUserParts []interface{}
 		for _, raw := range v {
@@ -1465,6 +1709,14 @@ func convertOpenAIResponsesInputToAnthropic(instructions string, input interface
 					return nil, nil, err
 				}
 				anthropicMsgs = append(anthropicMsgs, msg)
+			case itemType == "function_call":
+				flushPendingUser(pendingUserParts)
+				pendingUserParts = nil
+				content, err := convertOpenAIFunctionCallToAnthropicContent(item, aliases)
+				if err != nil {
+					return nil, nil, err
+				}
+				anthropicMsgs = append(anthropicMsgs, AnthropicMessage{Role: "assistant", Content: content})
 			case itemType == "function_call_output":
 				flushPendingUser(pendingUserParts)
 				pendingUserParts = nil
@@ -1493,6 +1745,35 @@ func convertOpenAIResponsesInputToAnthropic(instructions string, input interface
 		system = strings.Join(systemParts, "\n\n")
 	}
 	return system, anthropicMsgs, nil
+}
+
+func convertOpenAIFunctionCallToAnthropicContent(item map[string]interface{}, aliases map[string]openAIToolIdentity) (interface{}, error) {
+	callID := strings.TrimSpace(stringValue(item["call_id"]))
+	if callID == "" {
+		return nil, fmt.Errorf("function_call.call_id is required")
+	}
+	name := strings.TrimSpace(stringValue(item["name"]))
+	if name == "" {
+		return nil, fmt.Errorf("function_call.name is required")
+	}
+	namespace := strings.TrimSpace(stringValue(item["namespace"]))
+	alias, err := resolveOpenAIToolAlias(namespace, name, aliases)
+	if err != nil {
+		return nil, fmt.Errorf("function_call references %w", err)
+	}
+	arguments := strings.TrimSpace(stringValue(item["arguments"]))
+	if arguments == "" {
+		arguments = "{}"
+	}
+	if !json.Valid([]byte(arguments)) {
+		return nil, fmt.Errorf("function_call %s has invalid JSON arguments", name)
+	}
+	return []interface{}{map[string]interface{}{
+		"type":  "tool_use",
+		"id":    callID,
+		"name":  alias,
+		"input": json.RawMessage(arguments),
+	}}, nil
 }
 
 func convertGenericOpenAIMessageToAnthropic(role string, item map[string]interface{}) (AnthropicMessage, error) {
