@@ -40,6 +40,64 @@ func TestNeedsFreshThreadRecoveryIgnoresWrapperOnlyUserMessage(t *testing.T) {
 	}
 }
 
+func TestNeedsFreshThreadRecoveryKeepsConsecutiveUserContextInline(t *testing.T) {
+	messages := []ChatMessage{
+		{Role: "system", Content: "You are Codex."},
+		{Role: "user", Content: "Repository context that must stay verbatim."},
+		{Role: "user", Content: "Fix the current failure."},
+	}
+
+	if needsFreshThreadRecovery(messages) {
+		t.Fatal("consecutive user context without assistant/tool history must not be collapsed")
+	}
+	got := buildFreshThreadRecoveryMessages(messages)
+	if len(got) != len(messages) || got[1].Content != messages[1].Content || got[2].Content != messages[2].Content {
+		t.Fatalf("first-turn context was not preserved inline: %#v", got)
+	}
+}
+
+func TestFreshThreadRecoveryIncludesToolChainEndingInToolResult(t *testing.T) {
+	messages := []ChatMessage{
+		{Role: "system", Content: "Use repository evidence."},
+		{Role: "user", Content: "Read README.md and summarize it."},
+		{Role: "assistant", ToolCalls: []ToolCall{{
+			ID:   "call_1",
+			Type: "function",
+			Function: ToolCallFunction{
+				Name:      "Read",
+				Arguments: `{"path":"README.md"}`,
+			},
+		}}},
+		{Role: "tool", Name: "Read", ToolCallID: "call_1", Content: "README file contents"},
+	}
+
+	if !needsFreshThreadRecovery(messages) {
+		t.Fatal("tool history ending in a tool result must require fresh-thread recovery")
+	}
+	got := buildFreshThreadRecoveryMessages(messages)
+	if len(got) != 1 {
+		t.Fatalf("expected 1 collapsed message, got %d", len(got))
+	}
+	for _, want := range []string{
+		"Use repository evidence.",
+		"Latest user message:\nRead README.md and summarize it.",
+		`Tool call Read: {"path":"README.md"}`,
+		"Tool (Read): README file contents",
+	} {
+		if !strings.Contains(got[0].Content, want) {
+			t.Fatalf("expected collapsed tool chain to contain %q, got %q", want, got[0].Content)
+		}
+	}
+	body := got[0].Content
+	userIndex := strings.Index(body, "User: Read README.md and summarize it.")
+	callIndex := strings.Index(body, `Tool call Read: {"path":"README.md"}`)
+	resultIndex := strings.Index(body, "Tool (Read): README file contents")
+	latestIndex := strings.Index(body, "Latest user message:\nRead README.md and summarize it.")
+	if !(userIndex >= 0 && userIndex < callIndex && callIndex < resultIndex && resultIndex < latestIndex) {
+		t.Fatalf("collapsed tool chain order is wrong: %q", body)
+	}
+}
+
 func TestCountNonSystemMessagesIgnoresWrapperOnlyUserMessage(t *testing.T) {
 	messages := []ChatMessage{
 		{Role: "system", Content: "You are Claude Code."},
@@ -80,6 +138,24 @@ func TestBuildFreshThreadRecoveryMessagesCollapsesHistory(t *testing.T) {
 		if !strings.Contains(body, want) {
 			t.Fatalf("expected collapsed prompt to contain %q, got %q", want, body)
 		}
+	}
+}
+
+func TestBuildFreshThreadRecoveryMessagesPreservesCompleteSystemInstructions(t *testing.T) {
+	const tailMarker = "SYSTEM-INSTRUCTIONS-TAIL-MARKER"
+	messages := []ChatMessage{
+		{Role: "system", Content: strings.Repeat("x", 1600) + tailMarker},
+		{Role: "user", Content: "first question"},
+		{Role: "assistant", Content: "first answer"},
+		{Role: "user", Content: "follow-up"},
+	}
+
+	got := buildFreshThreadRecoveryMessages(messages)
+	if len(got) != 1 {
+		t.Fatalf("expected 1 collapsed message, got %d", len(got))
+	}
+	if !strings.Contains(got[0].Content, tailMarker) {
+		t.Fatalf("system instruction tail was truncated: %q", got[0].Content)
 	}
 }
 

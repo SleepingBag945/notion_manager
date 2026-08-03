@@ -15,6 +15,76 @@ func TestExtractAnthropicSessionSalt(t *testing.T) {
 	}
 }
 
+func TestExtractAnthropicSessionSaltFromPlainStrings(t *testing.T) {
+	tests := []struct {
+		name     string
+		metadata map[string]interface{}
+		want     string
+	}{
+		{name: "prompt cache key", metadata: map[string]interface{}{"prompt_cache_key": " task-123 "}, want: "task-123"},
+		{name: "session id", metadata: map[string]interface{}{"session_id": "session-123"}, want: "session-123"},
+		{name: "conversation id", metadata: map[string]interface{}{"conversation_id": "conversation-123"}, want: "conversation-123"},
+		{name: "user id", metadata: map[string]interface{}{"user_id": "user-123"}, want: "user-123"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := extractAnthropicSessionSalt(tt.metadata); got != tt.want {
+				t.Fatalf("extractAnthropicSessionSalt() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestComputeSessionFingerprintForRequestSeparatesPromptCacheKeysAndModels(t *testing.T) {
+	messages := []ChatMessage{
+		{Role: "system", Content: "You are a coding assistant."},
+		{Role: "user", Content: "Fix the failing test."},
+	}
+
+	base := computeSessionFingerprintForRequest(messages, "task-a", "fireworks-kimi-k3")
+	otherTask := computeSessionFingerprintForRequest(messages, "task-b", "fireworks-kimi-k3")
+	otherModel := computeSessionFingerprintForRequest(messages, "task-a", "anthropic-opus-4-6")
+	continued := computeSessionFingerprintForRequest(append(cloneChatMessages(messages),
+		ChatMessage{Role: "assistant", Content: "I will inspect it."},
+		ChatMessage{Role: "user", Content: "Continue."},
+	), "task-a", "fireworks-kimi-k3")
+	if base == otherTask {
+		t.Fatal("different prompt_cache_key values must not reuse a Notion thread")
+	}
+	if base == otherModel {
+		t.Fatal("different resolved models must not reuse a Notion thread")
+	}
+	if base != continued {
+		t.Fatal("the same prompt_cache_key and model must keep the Notion thread across turns")
+	}
+}
+
+func TestComputeSessionFingerprintForRequestUsesStableSaltIdentity(t *testing.T) {
+	first := []ChatMessage{
+		{Role: "system", Content: "System instructions v1"},
+		{Role: "user", Content: "First user message"},
+	}
+	drifted := []ChatMessage{
+		{Role: "system", Content: "Completely different system instructions"},
+		{Role: "user", Content: "A different user message"},
+		{Role: "assistant", Content: "Prior answer"},
+		{Role: "tool", Name: "Read", ToolCallID: "call_1", Content: "tool history"},
+	}
+
+	fp1 := computeSessionFingerprintForRequest(first, "task-stable", "fireworks-kimi-k3")
+	fp2 := computeSessionFingerprintForRequest(drifted, "task-stable", "fireworks-kimi-k3")
+	if fp1 != fp2 {
+		t.Fatalf("same prompt_cache_key and resolved model must remain stable across message drift: %s != %s", fp1, fp2)
+	}
+
+	fallback1 := computeSessionFingerprintForRequest(first, "", "fireworks-kimi-k3")
+	fallback2 := computeSessionFingerprintForRequest(drifted, "", "fireworks-kimi-k3")
+	if fallback1 == fallback2 {
+		t.Fatal("empty session salt must fall back to the model and message fingerprint")
+	}
+}
+
 func TestComputeSessionFingerprintWithSalt_IgnoresBillingHeaderDrift(t *testing.T) {
 	turn1 := []ChatMessage{
 		{Role: "system", Content: "x-anthropic-billing-header: cc_version=2.1.81.a; cch=aaaa;\nYou are Claude Code, Anthropic's official CLI for Claude.\nSystem body"},

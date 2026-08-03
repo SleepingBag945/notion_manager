@@ -12,7 +12,9 @@ func TestConvertOpenAIChatCompletionRequest_WithFilesToolsAndJSONSchema(t *testi
 	pdfData := base64.StdEncoding.EncodeToString([]byte("%PDF-1.4 mock"))
 	imageData := base64.StdEncoding.EncodeToString([]byte("png-bytes"))
 	req := &OpenAIChatCompletionRequest{
-		Model: "gpt-5.4",
+		Model:          "gpt-5.4",
+		PromptCacheKey: "task-chat-123",
+		Metadata:       map[string]interface{}{"source": "codex"},
 		Messages: []OpenAIChatMessage{
 			{Role: "developer", Content: "Always answer in Chinese."},
 			{Role: "user", Content: []interface{}{
@@ -51,6 +53,9 @@ func TestConvertOpenAIChatCompletionRequest_WithFilesToolsAndJSONSchema(t *testi
 	if anthReq.Model != "gpt-5.4" {
 		t.Fatalf("model = %q, want gpt-5.4", anthReq.Model)
 	}
+	if anthReq.Metadata["prompt_cache_key"] != "task-chat-123" || anthReq.Metadata["source"] != "codex" {
+		t.Fatalf("metadata = %#v", anthReq.Metadata)
+	}
 	if anthReq.System != "Always answer in Chinese." {
 		t.Fatalf("system = %#v", anthReq.System)
 	}
@@ -83,8 +88,9 @@ func TestConvertOpenAIChatCompletionRequest_WithFilesToolsAndJSONSchema(t *testi
 
 func TestConvertOpenAIResponsesRequest_WithFunctionCallOutput(t *testing.T) {
 	req := &OpenAIResponsesRequest{
-		Model:        "gpt-5.4",
-		Instructions: "Return JSON only.",
+		Model:          "gpt-5.4",
+		PromptCacheKey: "task-responses-123",
+		Instructions:   "Return JSON only.",
 		Input: []interface{}{
 			map[string]interface{}{"type": "input_text", "text": "hello"},
 			map[string]interface{}{"type": "function_call_output", "call_id": "call_123", "output": "done"},
@@ -98,6 +104,9 @@ func TestConvertOpenAIResponsesRequest_WithFunctionCallOutput(t *testing.T) {
 	}
 	if anthReq.System != "Return JSON only." {
 		t.Fatalf("system = %#v", anthReq.System)
+	}
+	if anthReq.Metadata["prompt_cache_key"] != "task-responses-123" {
+		t.Fatalf("metadata = %#v", anthReq.Metadata)
 	}
 	if anthReq.OutputConfig == nil || anthReq.OutputConfig.Format == nil || anthReq.OutputConfig.Format.Type != "json_schema" {
 		t.Fatalf("output_config = %#v", anthReq.OutputConfig)
@@ -113,6 +122,43 @@ func TestConvertOpenAIResponsesRequest_WithFunctionCallOutput(t *testing.T) {
 	toolResult := secondBlocks[0].(map[string]interface{})
 	if toolResult["type"] != "tool_result" || toolResult["tool_use_id"] != "call_123" {
 		t.Fatalf("tool result = %#v", toolResult)
+	}
+}
+
+func TestConvertOpenAIResponsesRequestPreservesDeveloperInstructionsAndTaskIdentity(t *testing.T) {
+	req := &OpenAIResponsesRequest{
+		Model:          "kimi-k3",
+		PromptCacheKey: "codex-task-123",
+		Input: []interface{}{
+			map[string]interface{}{
+				"type": "message",
+				"role": "developer",
+				"content": []interface{}{
+					map[string]interface{}{"type": "input_text", "text": "完整保留这段开发者指令。"},
+				},
+			},
+			map[string]interface{}{
+				"type": "message",
+				"role": "user",
+				"content": []interface{}{
+					map[string]interface{}{"type": "input_text", "text": "回答当前问题。"},
+				},
+			},
+		},
+	}
+
+	anthReq, err := convertOpenAIResponsesRequest(req)
+	if err != nil {
+		t.Fatalf("convertOpenAIResponsesRequest() error = %v", err)
+	}
+	if anthReq.System != "完整保留这段开发者指令。" {
+		t.Fatalf("system = %#v", anthReq.System)
+	}
+	if anthReq.Metadata["prompt_cache_key"] != "codex-task-123" {
+		t.Fatalf("metadata = %#v", anthReq.Metadata)
+	}
+	if len(anthReq.Messages) != 1 || anthReq.Messages[0].Role != "user" {
+		t.Fatalf("messages = %#v", anthReq.Messages)
 	}
 }
 

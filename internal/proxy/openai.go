@@ -83,6 +83,7 @@ type OpenAIChatStreamOptions struct {
 type OpenAIChatCompletionRequest struct {
 	Model               string                     `json:"model"`
 	Messages            []OpenAIChatMessage        `json:"messages"`
+	PromptCacheKey      string                     `json:"prompt_cache_key,omitempty"`
 	Stream              bool                       `json:"stream,omitempty"`
 	Tools               []OpenAITool               `json:"tools,omitempty"`
 	ToolChoice          interface{}                `json:"tool_choice,omitempty"`
@@ -120,6 +121,7 @@ type OpenAIResponsesTextConfig struct {
 type OpenAIResponsesRequest struct {
 	Model              string                     `json:"model"`
 	Input              interface{}                `json:"input"`
+	PromptCacheKey     string                     `json:"prompt_cache_key,omitempty"`
 	Stream             bool                       `json:"stream,omitempty"`
 	Tools              []OpenAITool               `json:"tools,omitempty"`
 	ToolChoice         interface{}                `json:"tool_choice,omitempty"`
@@ -1256,7 +1258,7 @@ func convertOpenAIChatCompletionRequest(req *OpenAIChatCompletionRequest) (*Anth
 		Tools:        tools,
 		ToolChoice:   normalizeOpenAIToolChoice(req.ToolChoice, req.FunctionCall),
 		OutputConfig: convertOpenAIResponseFormat(req.ResponseFormat),
-		Metadata:     req.Metadata,
+		Metadata:     openAIMetadataWithPromptCacheKey(req.Metadata, req.PromptCacheKey),
 	}
 	return anthReq, nil
 }
@@ -1291,8 +1293,22 @@ func convertOpenAIResponsesRequest(req *OpenAIResponsesRequest) (*AnthropicReque
 		Tools:        tools,
 		ToolChoice:   req.ToolChoice,
 		OutputConfig: convertOpenAIResponsesTextFormat(req.Text),
-		Metadata:     req.Metadata,
+		Metadata:     openAIMetadataWithPromptCacheKey(req.Metadata, req.PromptCacheKey),
 	}, nil
+}
+
+func openAIMetadataWithPromptCacheKey(metadata map[string]interface{}, promptCacheKey string) map[string]interface{} {
+	promptCacheKey = strings.TrimSpace(promptCacheKey)
+	if promptCacheKey == "" {
+		return metadata
+	}
+
+	merged := make(map[string]interface{}, len(metadata)+1)
+	for key, value := range metadata {
+		merged[key] = value
+	}
+	merged["prompt_cache_key"] = promptCacheKey
+	return merged
 }
 
 func convertOpenAITools(tools []OpenAITool, functions []OpenAIFunctionDefinition) ([]AnthropicTool, error) {

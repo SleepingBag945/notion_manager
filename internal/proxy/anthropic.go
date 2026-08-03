@@ -619,20 +619,21 @@ func extractAnthropicSessionSalt(metadata map[string]interface{}) string {
 			}
 			var parsed map[string]interface{}
 			if json.Unmarshal([]byte(trimmed), &parsed) == nil {
-				if sid, ok := parsed["session_id"].(string); ok && sid != "" {
-					return sid
+				if sid, ok := parsed["session_id"].(string); ok && strings.TrimSpace(sid) != "" {
+					return strings.TrimSpace(sid)
 				}
+				return ""
 			}
-			return ""
+			return trimmed
 		case map[string]interface{}:
-			if sid, ok := tv["session_id"].(string); ok && sid != "" {
-				return sid
+			if sid, ok := tv["session_id"].(string); ok && strings.TrimSpace(sid) != "" {
+				return strings.TrimSpace(sid)
 			}
 		}
 		return ""
 	}
 
-	for _, key := range []string{"session_id", "conversation_id", "user_id"} {
+	for _, key := range []string{"prompt_cache_key", "session_id", "conversation_id", "user_id"} {
 		if sid := extractFromValue(metadata[key]); sid != "" {
 			return sid
 		}
@@ -779,6 +780,7 @@ func HandleAnthropicMessages(pool *AccountPool) http.HandlerFunc {
 			log.Printf("[ask-mode] %q -> %q (per-request override)", model, stripped)
 		}
 		model = stripped
+		resolvedModel := ResolveModel(model)
 		useReadOnlyMode := askFromModel || AppConfig.AskModeDefault()
 
 		// ── Detailed request logging ──
@@ -838,7 +840,7 @@ func HandleAnthropicMessages(pool *AccountPool) http.HandlerFunc {
 		rawMsgCount := 0
 
 		if !isResearcher {
-			fingerprint = computeSessionFingerprintWithSalt(messages, sessionSalt)
+			fingerprint = computeSessionFingerprintForRequest(messages, sessionSalt, resolvedModel)
 			session = globalSessionManager.Get(fingerprint)
 			rawMsgCount = countNonSystemMessages(messages)
 
@@ -989,16 +991,6 @@ func HandleAnthropicMessages(pool *AccountPool) http.HandlerFunc {
 			// sets) cannot leak into subsequent retries on a different
 			// account.
 			attemptMessages := cloneChatMessages(originalMessages)
-			attemptFileAttachments := append([]FileAttachment(nil), fileAttachments...)
-			var largeSystemAttachment *FileAttachment
-			if !isResearcher {
-				largeSystemAttachment = buildLargeSystemAttachment(attemptMessages, isFirstTurn)
-				if largeSystemAttachment != nil {
-					attemptFileAttachments = append([]FileAttachment{*largeSystemAttachment}, attemptFileAttachments...)
-					log.Printf("[upload] %s: offloaded large system instructions into %s (%d bytes) for account %s",
-						requestID, largeSystemAttachment.FileName, len(largeSystemAttachment.Data), acc.UserEmail)
-				}
-			}
 			if hasTools {
 				attemptMessages = injectToolsIntoMessages(attemptMessages, convertedTools, model, session, req.ToolChoice)
 				if DebugLoggingEnabled() && attempt == 0 {
@@ -1009,9 +1001,6 @@ func HandleAnthropicMessages(pool *AccountPool) http.HandlerFunc {
 							i, m.Role, len(m.ToolCalls), len(m.Content), preview)
 					}
 				}
-			}
-			if largeSystemAttachment != nil {
-				attemptMessages = replaceSystemMessagesWithAttachmentBootstrap(attemptMessages)
 			}
 
 			requestMessages := attemptMessages
@@ -1027,9 +1016,6 @@ func HandleAnthropicMessages(pool *AccountPool) http.HandlerFunc {
 					}
 					requestMessages = collapsed
 				}
-			}
-			if largeSystemAttachment != nil {
-				requestMessages = replaceSystemMessagesWithAttachmentBootstrap(requestMessages)
 			}
 
 			// For first turn, pre-create session with generated IDs
@@ -1053,37 +1039,23 @@ func HandleAnthropicMessages(pool *AccountPool) http.HandlerFunc {
 			}
 
 			log.Printf("[req] %s model=%s messages=%d stream=%v tools=%d attachments=%d account=%s session=%v (attempt %d/%d) [anthropic]",
-				requestID, model, len(req.Messages), req.Stream, len(req.Tools), len(attemptFileAttachments), acc.UserEmail, !isFirstTurn, attempt+1, maxAttempts)
+				requestID, model, len(req.Messages), req.Stream, len(req.Tools), len(fileAttachments), acc.UserEmail, !isFirstTurn, attempt+1, maxAttempts)
 
 			// Upload file attachments to Notion (if any) — skip for researcher mode
 			var uploadedAttachments []UploadedAttachment
-			var uploadErr error
-			if !isResearcher && len(attemptFileAttachments) > 0 {
-				uploadPlan := buildAttachmentUploadPlan(currentSession.ThreadID, len(attemptFileAttachments), isFirstTurn)
-				for i := range attemptFileAttachments {
-					fa := &attemptFileAttachments[i]
-					target := uploadPlan[i]
+			if !isResearcher && len(fileAttachments) > 0 {
+				for i, fa := range fileAttachments {
 					log.Printf("[upload-debug] %s: uploading attachment %d/%d: %s (%s, %d bytes)",
-						requestID, i+1, len(attemptFileAttachments), fa.FileName, fa.ContentType, len(fa.Data))
-					uploaded, err := UploadFileToNotionThread(acc, fa, target.ThreadID, target.CreateThread)
+						requestID, i+1, len(fileAttachments), fa.FileName, fa.ContentType, len(fa.Data))
+					uploaded, err := UploadFileToNotion(acc, &fa)
 					if err != nil {
 						log.Printf("[upload] %s: attachment %d upload failed: %v", requestID, i+1, err)
-						uploadErr = fmt.Errorf("file upload failed: %w", err)
-						break
+						writeAnthropicError(w, requestID, http.StatusBadGateway, "file upload failed: "+err.Error(), "api_error")
+						return
 					}
 					uploadedAttachments = append(uploadedAttachments, *uploaded)
 					log.Printf("[upload-debug] %s: attachment %d uploaded: %s", requestID, i+1, uploaded.AttachmentURL)
 				}
-			}
-			if uploadErr != nil {
-				lastNonQuotaErr = uploadErr
-				if !isFirstTurn && session != nil {
-					globalSessionManager.Delete(fingerprint)
-					session = nil
-					isFirstTurn = true
-					isRepeatTurn = false
-				}
-				continue
 			}
 
 			// For streaming responses, default to emitting thinking blocks even when
@@ -1207,7 +1179,7 @@ func HandleAnthropicMessages(pool *AccountPool) http.HandlerFunc {
 					currentSession.TurnCount = 1
 					currentSession.RawMessageCount = rawMsgCount
 					currentSession.UpdatedConfigIDs = []string{generateUUIDv4()}
-					currentSession.ModelUsed = ResolveModel(model)
+					currentSession.ModelUsed = resolvedModel
 					globalSessionManager.Set(fingerprint, currentSession)
 					log.Printf("[session] saved new session: thread=%s fingerprint=%s rawMsgs=%d",
 						currentSession.ThreadID, fingerprint[:8], rawMsgCount)

@@ -23,19 +23,7 @@ import (
 //
 // Returns an UploadedAttachment with the attachment:UUID:filename URL for transcript injection.
 func UploadFileToNotion(acc *Account, file *FileAttachment) (*UploadedAttachment, error) {
-	return UploadFileToNotionThread(acc, file, generateUUIDv4(), true)
-}
-
-// UploadFileToNotionThread uploads a file into an explicit Notion thread.
-// createThread must only be true for the first attachment that initializes a thread.
-func UploadFileToNotionThread(acc *Account, file *FileAttachment, threadID string, createThread bool) (*UploadedAttachment, error) {
-	if file == nil {
-		return nil, fmt.Errorf("file is required")
-	}
-	if strings.TrimSpace(threadID) == "" {
-		return nil, fmt.Errorf("thread ID is required")
-	}
-
+	sessionID := generateUUIDv4()
 	client := getChromeHTTPClient(30 * time.Second)
 
 	// Generate UUID-based filename preserving original extension
@@ -51,11 +39,11 @@ func UploadFileToNotionThread(acc *Account, file *FileAttachment, threadID strin
 		Name:         uuidFileName,
 		ContentType:  file.ContentType,
 		ContentLen:   len(file.Data),
-		CreateThread: createThread,
+		CreateThread: true,
 		Pointer: NotionAssistantChatPointer{
 			SpaceID: acc.SpaceID,
 			Table:   "thread",
-			ID:      threadID,
+			ID:      sessionID,
 		},
 	}
 
@@ -84,7 +72,7 @@ func UploadFileToNotionThread(acc *Account, file *FileAttachment, threadID strin
 				AISessionPointer: NotionAssistantChatPointer{
 					SpaceID: acc.SpaceID,
 					Table:   "thread",
-					ID:      threadID,
+					ID:      sessionID,
 				},
 				Source:        "user_upload",
 				ClientVersion: acc.ClientVersion,
@@ -189,29 +177,9 @@ func UploadFileToNotionThread(acc *Account, file *FileAttachment, threadID strin
 		FileName:      file.FileName,
 		ContentType:   file.ContentType,
 		FileSizeBytes: int64(len(file.Data)),
-		SessionID:     threadID,
+		SessionID:     sessionID,
 		Metadata:      metadata,
 	}, nil
-}
-
-type attachmentUploadTarget struct {
-	ThreadID     string
-	CreateThread bool
-}
-
-func buildAttachmentUploadPlan(threadID string, attachmentCount int, createThread bool) []attachmentUploadTarget {
-	if attachmentCount <= 0 {
-		return nil
-	}
-
-	plan := make([]attachmentUploadTarget, attachmentCount)
-	for i := range plan {
-		plan[i] = attachmentUploadTarget{
-			ThreadID:     threadID,
-			CreateThread: createThread && i == 0,
-		}
-	}
-	return plan
 }
 
 // BuildAttachmentTranscript creates an attachment transcript entry from an uploaded file.
