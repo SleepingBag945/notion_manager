@@ -636,7 +636,7 @@ func HandleAdminDeleteAccount(deps *RegisterJobsDeps) http.HandlerFunc {
 // matches and drops the corresponding pool entry. Returns os.ErrNotExist if
 // no file matches; that's mapped to a 404 by the handler.
 func deleteAccountByEmail(pool *AccountPool, dir, email string) error {
-	entries, err := os.ReadDir(dir)
+	entries, err := readPrivateAccountsDir(dir)
 	if err != nil {
 		return err
 	}
@@ -646,9 +646,9 @@ func deleteAccountByEmail(pool *AccountPool, dir, email string) error {
 			continue
 		}
 		path := filepath.Join(dir, e.Name())
-		data, err := os.ReadFile(path)
+		data, err := readPrivateAccountFile(path)
 		if err != nil {
-			continue
+			return err
 		}
 		var raw map[string]interface{}
 		if err := json.Unmarshal(data, &raw); err != nil {
@@ -688,7 +688,7 @@ func isAccountID(s string) bool {
 // deleteAccountByID removes the account JSON file whose account_id field
 // matches (or can be computed from user_id+space_id) and drops the pool entry.
 func deleteAccountByID(pool *AccountPool, dir, accountID string) error {
-	entries, err := os.ReadDir(dir)
+	entries, err := readPrivateAccountsDir(dir)
 	if err != nil {
 		return err
 	}
@@ -698,9 +698,9 @@ func deleteAccountByID(pool *AccountPool, dir, accountID string) error {
 			continue
 		}
 		path := filepath.Join(dir, e.Name())
-		data, err := os.ReadFile(path)
+		data, err := readPrivateAccountFile(path)
 		if err != nil {
-			continue
+			return err
 		}
 		var raw map[string]interface{}
 		if err := json.Unmarshal(data, &raw); err != nil {

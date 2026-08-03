@@ -727,6 +727,15 @@ func applyStructuredOutputBridge(messages []ChatMessage, outputConfig *Anthropic
 
 // ========== Handler ==========
 
+func handlePremiumFeatureUnavailable(pool *AccountPool, acc *Account) {
+	if isFreePlan(acc) {
+		log.Printf("[premium] %s (free plan) premium feature unavailable — disabling permanently", acc.UserEmail)
+		pool.MarkInferenceUnavailable(acc)
+		return
+	}
+	log.Printf("[premium] %s premium feature unavailable, trying next account", acc.UserEmail)
+}
+
 // HandleAnthropicMessages returns an HTTP handler for the /v1/messages endpoint (Anthropic Messages API)
 func HandleAnthropicMessages(pool *AccountPool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -935,10 +944,8 @@ func HandleAnthropicMessages(pool *AccountPool) http.HandlerFunc {
 					}
 					log.Printf("[session] bound account %s %s, will pick a new account and replay history",
 						session.AccountEmail, reason)
-					if bound != nil && isFreePlan(bound) {
-						pool.RemoveAccount(bound)
-					} else if bound != nil {
-						pool.MarkQuotaExhausted(bound)
+					if bound != nil {
+						pool.MarkInferenceUnavailable(bound)
 					}
 					globalSessionManager.Delete(fingerprint)
 					session = nil
@@ -976,11 +983,7 @@ func HandleAnthropicMessages(pool *AccountPool) http.HandlerFunc {
 			if !isResearcher && !pool.RefreshAccountQuota(acc, liveCheckInterval) {
 				log.Printf("[quota-live] %s skipped (exhausted on live check)", acc.UserEmail)
 				tried[acc] = true
-				if isFreePlan(acc) {
-					pool.RemoveAccount(acc)
-				} else {
-					pool.MarkQuotaExhausted(acc)
-				}
+				pool.MarkInferenceUnavailable(acc)
 				continue
 			}
 			tried[acc] = true
@@ -1095,11 +1098,11 @@ func HandleAnthropicMessages(pool *AccountPool) http.HandlerFunc {
 			}
 			if reqErr != nil && errors.Is(reqErr, ErrQuotaExhausted) {
 				if isFreePlan(acc) {
-					log.Printf("[quota] %s (free plan) quota exhausted — removing account", acc.UserEmail)
-					pool.RemoveAccount(acc)
+					log.Printf("[quota] %s (free plan) quota exhausted — disabling permanently", acc.UserEmail)
 				} else {
-					pool.MarkQuotaExhausted(acc)
+					log.Printf("[quota] %s quota exhausted — disabling until API-confirmed recovery", acc.UserEmail)
 				}
+				pool.MarkInferenceUnavailable(acc)
 				log.Printf("[quota] %s quota exhausted, trying next account (%d/%d available)",
 					acc.UserEmail, pool.AvailableCount(), pool.Count())
 				// Clear session if the bound account was exhausted
@@ -1145,12 +1148,7 @@ func HandleAnthropicMessages(pool *AccountPool) http.HandlerFunc {
 
 			if reqErr != nil && errors.Is(reqErr, ErrPremiumFeatureUnavailable) {
 				// Premium feature unavailable — for free accounts this means quota is permanently gone
-				if isFreePlan(acc) {
-					log.Printf("[premium] %s (free plan) premium feature unavailable — removing account", acc.UserEmail)
-					pool.RemoveAccount(acc)
-				} else {
-					log.Printf("[premium] %s premium feature unavailable, trying next account", acc.UserEmail)
-				}
+				handlePremiumFeatureUnavailable(pool, acc)
 				if !isFirstTurn && session != nil {
 					globalSessionManager.Delete(fingerprint)
 					session = nil

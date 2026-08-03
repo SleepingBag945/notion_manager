@@ -15,6 +15,144 @@ import (
 	"notion-manager/internal/regjob/providers/microsoft"
 )
 
+var (
+	discoverAccountFromToken = proxy.DiscoverAccountFromTokenWithOptions
+	saveAccountToFile        = proxy.SaveAccountToFile
+)
+
+const maxStartupAccounts = 16
+
+type accountDiscoveryConfig struct {
+	tokenName string
+	tokenV2   string
+	options   proxy.AccountDiscoveryOptions
+}
+
+type discoveredStartupAccount struct {
+	config  accountDiscoveryConfig
+	account *proxy.Account
+}
+
+func indexedSecretName(base string, index int) string {
+	if index == 1 {
+		return base
+	}
+	return fmt.Sprintf("%s_%d", base, index)
+}
+
+func accountDiscoveryOptionsFromEnvironmentAt(index int) proxy.AccountDiscoveryOptions {
+	return proxy.AccountDiscoveryOptions{
+		ActiveUserID:  strings.TrimSpace(os.Getenv(indexedSecretName("NOTION_ACTIVE_USER_ID", index))),
+		SpaceID:       strings.TrimSpace(os.Getenv(indexedSecretName("NOTION_SPACE_ID", index))),
+		ExpectedEmail: strings.TrimSpace(os.Getenv(indexedSecretName("NOTION_EXPECTED_EMAIL", index))),
+	}
+}
+
+func selectorsConfigured(options proxy.AccountDiscoveryOptions) bool {
+	return options.ActiveUserID != "" || options.SpaceID != "" || options.ExpectedEmail != ""
+}
+
+func accountDiscoveryConfigsFromEnvironment() ([]accountDiscoveryConfig, error) {
+	configs := make([]accountDiscoveryConfig, 0, maxStartupAccounts)
+	for index := 1; index <= maxStartupAccounts; index++ {
+		tokenName := indexedSecretName("NOTION_TOKEN_V2", index)
+		tokenV2 := strings.TrimSpace(os.Getenv(tokenName))
+		options := accountDiscoveryOptionsFromEnvironmentAt(index)
+		if tokenV2 == "" {
+			if selectorsConfigured(options) {
+				return nil, fmt.Errorf("%s is required when account selectors for slot %d are configured", tokenName, index)
+			}
+			continue
+		}
+		configs = append(configs, accountDiscoveryConfig{
+			tokenName: tokenName,
+			tokenV2:   tokenV2,
+			options:   options,
+		})
+	}
+	return configs, nil
+}
+
+func accountDiscoveryConfigured() bool {
+	for index := 1; index <= maxStartupAccounts; index++ {
+		if strings.TrimSpace(os.Getenv(indexedSecretName("NOTION_TOKEN_V2", index))) != "" || selectorsConfigured(accountDiscoveryOptionsFromEnvironmentAt(index)) {
+			return true
+		}
+	}
+	return false
+}
+
+func loadDiscoveredAccounts(pool *proxy.AccountPool, accountsDir string, configs []accountDiscoveryConfig) error {
+	discovered := make([]discoveredStartupAccount, 0, len(configs))
+	seenAccountIDs := make(map[string]struct{}, len(configs))
+	for _, config := range configs {
+		acc, err := discoverAccountFromToken(config.tokenV2, config.options)
+		if err != nil {
+			return fmt.Errorf("discover account from %s failed", config.tokenName)
+		}
+		if acc == nil {
+			return fmt.Errorf("discover account from %s returned no account", config.tokenName)
+		}
+		acc.EnsureAccountID()
+		if acc.AccountID == "" {
+			return fmt.Errorf("discover account from %s returned an incomplete identity", config.tokenName)
+		}
+		if _, duplicate := seenAccountIDs[acc.AccountID]; duplicate {
+			continue
+		}
+		seenAccountIDs[acc.AccountID] = struct{}{}
+		discovered = append(discovered, discoveredStartupAccount{config: config, account: acc})
+	}
+
+	for _, item := range discovered {
+		if _, err := saveAccountToFile(item.account, accountsDir); err != nil {
+			return fmt.Errorf("persist account from %s failed", item.config.tokenName)
+		}
+	}
+	for _, item := range discovered {
+		pool.AddAccount(item.account)
+	}
+	return nil
+}
+
+func loadInitialAccount(pool *proxy.AccountPool, accountsDir, tokenFile string) error {
+	configs, err := accountDiscoveryConfigsFromEnvironment()
+	if err != nil {
+		return err
+	}
+	if len(configs) > 0 {
+		return loadDiscoveredAccounts(pool, accountsDir, configs)
+	}
+	if pool.Count() > 0 {
+		return nil
+	}
+
+	if _, err := os.Stat(tokenFile); err == nil {
+		if err := pool.LoadSingle(tokenFile); err != nil {
+			return fmt.Errorf("load %s: %w", tokenFile, err)
+		}
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("stat %s: %w", tokenFile, err)
+	}
+	return nil
+}
+
+func loadStartupAccounts(pool *proxy.AccountPool, accountsDir, tokenFile string) error {
+	stagedPool := proxy.NewAccountPool()
+	if _, err := os.Stat(accountsDir); err == nil {
+		if err := stagedPool.LoadFromDir(accountsDir); err != nil {
+			log.Printf("[warn] %v", err)
+		}
+	}
+	if err := loadInitialAccount(stagedPool, accountsDir, tokenFile); err != nil {
+		return err
+	}
+	for _, account := range stagedPool.AccountsSnapshot() {
+		pool.AddAccount(account)
+	}
+	return nil
+}
+
 func requiresAPIKey(path string) bool {
 	return path == "/models" || strings.HasPrefix(path, "/v1/")
 }
@@ -132,23 +270,12 @@ func main() {
 	tokenFile := cfg.Server.TokenFile
 
 	pool := proxy.NewAccountPool()
-
-	if _, err := os.Stat(accountsDir); err == nil {
-		if err := pool.LoadFromDir(accountsDir); err != nil {
-			log.Printf("[warn] %v", err)
+	discoveryConfigured := accountDiscoveryConfigured()
+	if err := loadStartupAccounts(pool, accountsDir, tokenFile); err != nil {
+		if discoveryConfigured {
+			log.Fatalf("[account] %v", err)
 		}
-	}
-
-	if pool.Count() == 0 {
-		tokenV2 := os.Getenv("NOTION_TOKEN_V2")
-		if tokenV2 == "" {
-			if data, err := os.ReadFile(tokenFile); err == nil {
-				tokenV2 = strings.TrimSpace(string(data))
-			}
-		}
-		if tokenV2 != "" {
-			pool.LoadSingle(tokenFile)
-		}
+		log.Printf("[warn] %v", err)
 	}
 
 	if pool.Count() == 0 {

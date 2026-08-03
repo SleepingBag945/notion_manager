@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -519,5 +520,391 @@ func TestSaveAccountToFile_FilenameNoSecrets(t *testing.T) {
 		if strings.Contains(fn, secret) {
 			t.Errorf("filename %q contains secret %q", fn, secret)
 		}
+	}
+}
+
+func persistenceTestAccount(email string) *Account {
+	return &Account{
+		TokenV2:   "test-token",
+		UserID:    "test-user-" + email,
+		UserName:  "Test User",
+		UserEmail: email,
+		SpaceID:   "test-space-" + email,
+		SpaceName: "Test Space",
+		PlanType:  "free",
+		QuotaInfo: &QuotaInfo{
+			IsEligible: true,
+			SpaceLimit: 200,
+			UserLimit:  200,
+		},
+	}
+}
+
+func TestMarkInferenceUnavailableRetainsPoolAndAccountFile(t *testing.T) {
+	tests := []struct {
+		name                       string
+		prepare                    func(*Account)
+		wantPermanent              bool
+		wantAvailableAfterEligible int
+	}{
+		{name: "free", wantPermanent: true},
+		{
+			name:                       "paid",
+			wantAvailableAfterEligible: 1,
+			prepare: func(acc *Account) {
+				acc.PlanType = "plus"
+				acc.QuotaInfo.HasPremium = true
+				acc.QuotaInfo.PremiumBalance = 100
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			acc := persistenceTestAccount(tt.name + "@example.com")
+			if tt.prepare != nil {
+				tt.prepare(acc)
+			}
+			filename, err := SaveAccountToFile(acc, dir)
+			if err != nil {
+				t.Fatalf("SaveAccountToFile() error = %v", err)
+			}
+
+			pool := NewAccountPool()
+			pool.AddAccount(acc)
+			if got := pool.AvailableCount(); got != 1 {
+				t.Fatalf("AvailableCount() before disable = %d, want 1", got)
+			}
+
+			pool.MarkInferenceUnavailable(acc)
+
+			if got := pool.Count(); got != 1 {
+				t.Errorf("Count() after automatic disable = %d, want retained total 1", got)
+			}
+			if got := pool.AvailableCount(); got != 0 {
+				t.Errorf("AvailableCount() after automatic disable = %d, want 0", got)
+			}
+			if pool.FindByAccountID(acc.AccountID) != acc {
+				t.Error("automatically disabled account was removed from pool")
+			}
+			if _, err := os.Stat(filepath.Join(dir, filename)); err != nil {
+				t.Errorf("account file was removed after automatic disable: %v", err)
+			}
+			quota := acc.quotaSnapshot()
+			if quota.ExhaustedAt == nil || quota.PermanentlyExhausted != tt.wantPermanent {
+				t.Errorf("automatic disable state = %+v, want permanent=%v", quota, tt.wantPermanent)
+			}
+
+			pool.applyQuotaInfo(acc, quota.Info)
+			if got := pool.AvailableCount(); got != tt.wantAvailableAfterEligible {
+				t.Errorf("AvailableCount() after eligible quota refresh = %d, want %d", got, tt.wantAvailableAfterEligible)
+			}
+		})
+	}
+}
+
+func TestAccountFilesUseOwnerOnlyPermissions(t *testing.T) {
+	t.Run("save and atomic rewrite", func(t *testing.T) {
+		dir := filepath.Join(t.TempDir(), "accounts")
+		if err := os.Mkdir(dir, 0o755); err != nil {
+			t.Fatalf("Mkdir() error = %v", err)
+		}
+		if err := os.Chmod(dir, 0o755); err != nil {
+			t.Fatalf("Chmod(dir) error = %v", err)
+		}
+
+		acc := persistenceTestAccount("save@example.com")
+		filename, err := SaveAccountToFile(acc, dir)
+		if err != nil {
+			t.Fatalf("SaveAccountToFile() error = %v", err)
+		}
+		path := filepath.Join(dir, filename)
+		assertMode(t, dir, accountsDirMode)
+		assertMode(t, path, accountFileMode)
+
+		if err := os.Chmod(dir, 0o755); err != nil {
+			t.Fatalf("Chmod(dir) error = %v", err)
+		}
+		if err := os.Chmod(path, 0o644); err != nil {
+			t.Fatalf("Chmod(file) error = %v", err)
+		}
+		acc.QuotaInfo.SpaceUsage = 25
+		if err := saveAccountFile(dir, acc); err != nil {
+			t.Fatalf("saveAccountFile() error = %v", err)
+		}
+		assertMode(t, dir, accountsDirMode)
+		assertMode(t, path, accountFileMode)
+		if _, err := os.Stat(path + ".tmp"); !os.IsNotExist(err) {
+			t.Errorf("atomic temporary file remains after rewrite: %v", err)
+		}
+	})
+
+	t.Run("load tightens existing permissions", func(t *testing.T) {
+		dir := filepath.Join(t.TempDir(), "accounts")
+		if err := os.Mkdir(dir, 0o755); err != nil {
+			t.Fatalf("Mkdir() error = %v", err)
+		}
+		if err := os.Chmod(dir, 0o755); err != nil {
+			t.Fatalf("Chmod(dir) error = %v", err)
+		}
+
+		acc := persistenceTestAccount("load@example.com")
+		data, err := json.Marshal(acc)
+		if err != nil {
+			t.Fatalf("json.Marshal() error = %v", err)
+		}
+		path := filepath.Join(dir, "existing.json")
+		if err := os.WriteFile(path, data, 0o644); err != nil {
+			t.Fatalf("WriteFile() error = %v", err)
+		}
+		if err := os.Chmod(path, 0o644); err != nil {
+			t.Fatalf("Chmod(file) error = %v", err)
+		}
+
+		pool := NewAccountPool()
+		if err := pool.LoadFromDir(dir); err != nil {
+			t.Fatalf("LoadFromDir() error = %v", err)
+		}
+		assertMode(t, dir, accountsDirMode)
+		assertMode(t, path, accountFileMode)
+	})
+}
+
+func TestAccountLoadsFailClosedWhenChmodFails(t *testing.T) {
+	errChmod := errors.New("chmod denied")
+	secret := "secret-token-must-not-appear"
+
+	t.Run("directory", func(t *testing.T) {
+		dir := t.TempDir()
+		stubAccountChmod(t, func(path string, mode os.FileMode) error {
+			if path == dir {
+				return errChmod
+			}
+			return os.Chmod(path, mode)
+		})
+		pool := NewAccountPool()
+		err := pool.LoadFromDir(dir)
+		assertSecureLoadError(t, err, errChmod, secret)
+		if got := pool.Count(); got != 0 {
+			t.Errorf("Count() = %d, want 0 after directory chmod failure", got)
+		}
+	})
+
+	t.Run("credential", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "blocked.json")
+		if err := os.WriteFile(path, []byte(secret), 0o644); err != nil {
+			t.Fatalf("WriteFile() error = %v", err)
+		}
+		stubAccountChmod(t, func(chmodPath string, mode os.FileMode) error {
+			if chmodPath == path {
+				return errChmod
+			}
+			return os.Chmod(chmodPath, mode)
+		})
+		pool := NewAccountPool()
+		err := pool.LoadFromDir(dir)
+		assertSecureLoadError(t, err, errChmod, secret)
+		if got := pool.Count(); got != 0 {
+			t.Errorf("Count() = %d, want 0 after credential chmod failure", got)
+		}
+	})
+
+	t.Run("single token", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "token.json")
+		if err := os.WriteFile(path, []byte(secret), 0o644); err != nil {
+			t.Fatalf("WriteFile() error = %v", err)
+		}
+		stubAccountChmod(t, func(chmodPath string, mode os.FileMode) error {
+			if chmodPath == path {
+				return errChmod
+			}
+			return os.Chmod(chmodPath, mode)
+		})
+		pool := NewAccountPool()
+		err := pool.LoadSingle(path)
+		assertSecureLoadError(t, err, errChmod, secret)
+		if got := pool.Count(); got != 0 {
+			t.Errorf("Count() = %d, want 0 after token chmod failure", got)
+		}
+	})
+}
+
+func TestReloadFromDirSkipsCredentialsWhoseChmodFails(t *testing.T) {
+	dir := t.TempDir()
+	blockedPath := filepath.Join(dir, "blocked.json")
+	if err := os.WriteFile(blockedPath, []byte("blocked-secret-token"), 0o644); err != nil {
+		t.Fatalf("WriteFile(blocked) error = %v", err)
+	}
+	goodData, err := json.Marshal(persistenceTestAccount("good@example.com"))
+	if err != nil {
+		t.Fatalf("json.Marshal() error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "good.json"), goodData, 0o644); err != nil {
+		t.Fatalf("WriteFile(good) error = %v", err)
+	}
+	errChmod := errors.New("chmod denied")
+	stubAccountChmod(t, func(path string, mode os.FileMode) error {
+		if path == blockedPath {
+			return errChmod
+		}
+		return os.Chmod(path, mode)
+	})
+
+	pool := NewAccountPool()
+	pool.ReloadFromDir(dir)
+	if got := pool.Count(); got != 1 {
+		t.Fatalf("Count() = %d, want only the securely loaded credential", got)
+	}
+	if _, err := pool.FindByEmail("good@example.com"); err != nil {
+		t.Errorf("secure credential was not loaded: %v", err)
+	}
+}
+
+func TestPremiumFeatureUnavailableOnlyDisablesFreeAccounts(t *testing.T) {
+	tests := []struct {
+		name          string
+		prepare       func(*Account)
+		wantAvailable int
+	}{
+		{name: "free", wantAvailable: 0},
+		{
+			name:          "paid",
+			wantAvailable: 1,
+			prepare: func(account *Account) {
+				account.PlanType = "plus"
+				account.QuotaInfo.HasPremium = true
+				account.QuotaInfo.PremiumBalance = 100
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			account := persistenceTestAccount(tt.name + "@example.com")
+			if tt.prepare != nil {
+				tt.prepare(account)
+			}
+			pool := NewAccountPool()
+			pool.AddAccount(account)
+
+			handlePremiumFeatureUnavailable(pool, account)
+
+			if got := pool.AvailableCount(); got != tt.wantAvailable {
+				t.Fatalf("AvailableCount() = %d, want %d", got, tt.wantAvailable)
+			}
+		})
+	}
+}
+
+func TestAccountCredentialScansChmodBeforeRead(t *testing.T) {
+	dir := t.TempDir()
+	account := persistenceTestAccount("scan@example.com")
+	account.EnsureAccountID()
+	data, err := json.Marshal(account)
+	if err != nil {
+		t.Fatalf("json.Marshal() error = %v", err)
+	}
+	path := filepath.Join(dir, "existing.json")
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	errChmod := errors.New("chmod denied")
+
+	t.Run("directory before save scan", func(t *testing.T) {
+		readCalls := 0
+		stubAccountReadFile(t, func(path string) ([]byte, error) {
+			readCalls++
+			return os.ReadFile(path)
+		})
+		stubAccountChmod(t, func(chmodPath string, mode os.FileMode) error {
+			if chmodPath == dir {
+				return errChmod
+			}
+			return os.Chmod(chmodPath, mode)
+		})
+
+		_, err := SaveAccountToFile(account, dir)
+		if !errors.Is(err, errChmod) {
+			t.Fatalf("SaveAccountToFile() error = %v, want wrapped %v", err, errChmod)
+		}
+		if readCalls != 0 {
+			t.Fatalf("credential reads = %d, want 0 before directory chmod succeeds", readCalls)
+		}
+	})
+
+	operations := []struct {
+		name string
+		run  func() error
+	}{
+		{
+			name: "save account",
+			run: func() error {
+				_, err := SaveAccountToFile(account, dir)
+				return err
+			},
+		},
+		{name: "rewrite account", run: func() error { return saveAccountFile(dir, account) }},
+		{name: "delete by id", run: func() error { return DeleteAccountFile(account.AccountID, dir) }},
+		{name: "delete by email", run: func() error { return DeleteAccountFileByEmail(account.UserEmail, dir) }},
+		{name: "admin delete by id", run: func() error { return deleteAccountByID(nil, dir, account.AccountID) }},
+		{name: "admin delete by email", run: func() error { return deleteAccountByEmail(nil, dir, account.UserEmail) }},
+	}
+	for _, operation := range operations {
+		t.Run(operation.name+" secures file", func(t *testing.T) {
+			readCalls := 0
+			stubAccountReadFile(t, func(path string) ([]byte, error) {
+				readCalls++
+				return os.ReadFile(path)
+			})
+			stubAccountChmod(t, func(chmodPath string, mode os.FileMode) error {
+				if chmodPath == path {
+					return errChmod
+				}
+				return os.Chmod(chmodPath, mode)
+			})
+
+			err := operation.run()
+			if !errors.Is(err, errChmod) {
+				t.Fatalf("operation error = %v, want wrapped %v", err, errChmod)
+			}
+			if readCalls != 0 {
+				t.Fatalf("credential reads = %d, want 0 before file chmod succeeds", readCalls)
+			}
+		})
+	}
+}
+
+func stubAccountChmod(t *testing.T, stub func(string, os.FileMode) error) {
+	t.Helper()
+	original := accountChmod
+	accountChmod = stub
+	t.Cleanup(func() { accountChmod = original })
+}
+
+func stubAccountReadFile(t *testing.T, stub func(string) ([]byte, error)) {
+	t.Helper()
+	original := accountReadFile
+	accountReadFile = stub
+	t.Cleanup(func() { accountReadFile = original })
+}
+
+func assertSecureLoadError(t *testing.T, got, want error, secret string) {
+	t.Helper()
+	if !errors.Is(got, want) {
+		t.Fatalf("error = %v, want wrapped %v", got, want)
+	}
+	if strings.Contains(got.Error(), secret) {
+		t.Errorf("permission error leaked credential content: %v", got)
+	}
+}
+
+func assertMode(t *testing.T, path string, want os.FileMode) {
+	t.Helper()
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("Stat(%q) error = %v", path, err)
+	}
+	if got := info.Mode().Perm(); got != want {
+		t.Errorf("mode(%q) = %04o, want %04o", path, got, want)
 	}
 }
