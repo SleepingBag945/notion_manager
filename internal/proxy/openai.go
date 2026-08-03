@@ -1709,6 +1709,11 @@ func convertOpenAIResponsesInputToAnthropic(instructions string, input interface
 					return nil, nil, err
 				}
 				anthropicMsgs = append(anthropicMsgs, msg)
+			case itemType == "reasoning":
+				// Codex replays Responses reasoning items on tool-result turns. The
+				// Anthropic bridge already discards echoed thinking blocks, so accept
+				// the item here without turning its summary into user-visible text.
+				continue
 			case itemType == "function_call":
 				flushPendingUser(pendingUserParts)
 				pendingUserParts = nil

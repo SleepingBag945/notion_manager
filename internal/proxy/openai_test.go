@@ -251,6 +251,7 @@ func TestConvertOpenAIResponsesRequestAcceptsNamespacedFunctionCallHistory(t *te
 		]}],
 		"input":[
 			{"type":"message","role":"user","content":[{"type":"input_text","text":"notify the agent"}]},
+			{"type":"reasoning","id":"rs_123","summary":[{"type":"summary_text","text":"Need to notify the agent."}]},
 			{"type":"function_call","call_id":"call_123","name":"send_message","namespace":"collaboration","arguments":"{\"target\":\"/root\"}"},
 			{"type":"function_call_output","call_id":"call_123","output":"delivered"}
 		]
