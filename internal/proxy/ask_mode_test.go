@@ -62,6 +62,33 @@ func TestBuildConfigValueRespectsUseReadOnlyMode(t *testing.T) {
 	}
 }
 
+func TestBuildConfigValueSetsModelForAllTurns(t *testing.T) {
+	prev := AppConfig
+	AppConfig = DefaultConfig()
+	defer func() { AppConfig = prev }()
+
+	tests := []struct {
+		name              string
+		isSubsequentTurn  bool
+		wantModelFromUser bool
+	}{
+		{name: "first turn", isSubsequentTurn: false, wantModelFromUser: true},
+		{name: "subsequent turn", isSubsequentTurn: true, wantModelFromUser: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := buildConfigValue("acai-budino-high", false, true, nil, false, false, tt.isSubsequentTurn)
+			if got := cfg["model"]; got != "acai-budino-high" {
+				t.Fatalf("model = %#v, want %q", got, "acai-budino-high")
+			}
+			if got := cfg["modelFromUser"]; got != tt.wantModelFromUser {
+				t.Fatalf("modelFromUser = %#v, want %v", got, tt.wantModelFromUser)
+			}
+		})
+	}
+}
+
 func TestAppConfigAskModeDefault(t *testing.T) {
 	prev := AppConfig
 	defer func() { AppConfig = prev }()

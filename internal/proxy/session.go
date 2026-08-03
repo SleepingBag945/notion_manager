@@ -23,6 +23,9 @@ type Session struct {
 	ConfigID  string
 	ContextID string
 
+	// ContextPageID is generated independently from the transcript IDs and reused across turns.
+	ContextPageID string
+
 	// Each completed turn produces one updated-config placeholder ID
 	UpdatedConfigIDs []string
 

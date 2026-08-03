@@ -150,19 +150,24 @@ type UsageInfo struct {
 // ========== Notion API Types ==========
 
 type NotionInferenceRequest struct {
-	TraceID                 string               `json:"traceId"`
-	SpaceID                 string               `json:"spaceId"`
-	ThreadID                string               `json:"threadId,omitempty"`
-	Transcript              []interface{}        `json:"transcript"`
-	CreateThread            bool                 `json:"createThread"`
-	GenerateTitle           bool                 `json:"generateTitle"`
-	SaveAllThreadOperations bool                 `json:"saveAllThreadOperations"`
-	SetUnreadState          bool                 `json:"setUnreadState"`
-	ThreadType              string               `json:"threadType"`
-	AsPatchResponse         bool                 `json:"asPatchResponse"`
-	IsPartialTranscript     bool                 `json:"isPartialTranscript"`
-	ThreadParentPointer     *ThreadParentPointer `json:"threadParentPointer,omitempty"`
-	DebugOverrides          DebugOverrides       `json:"debugOverrides"`
+	TraceID                                string               `json:"traceId"`
+	SpaceID                                string               `json:"spaceId"`
+	ThreadID                               string               `json:"threadId,omitempty"`
+	Transcript                             []interface{}        `json:"transcript"`
+	CreateThread                           bool                 `json:"createThread"`
+	GenerateTitle                          bool                 `json:"generateTitle"`
+	SaveAllThreadOperations                bool                 `json:"saveAllThreadOperations"`
+	SetUnreadState                         bool                 `json:"setUnreadState"`
+	ThreadType                             string               `json:"threadType"`
+	CreatedSource                          string               `json:"createdSource,omitempty"`
+	AsPatchResponse                        bool                 `json:"asPatchResponse"`
+	PatchResponseVersion                   int                  `json:"patchResponseVersion,omitempty"`
+	IsPartialTranscript                    bool                 `json:"isPartialTranscript"`
+	IsUserInAnySalesAssistedSpace          *bool                `json:"isUserInAnySalesAssistedSpace,omitempty"`
+	IsSpaceSalesAssisted                   *bool                `json:"isSpaceSalesAssisted,omitempty"`
+	SupportsCustomAgentNudgeTranscriptStep *bool                `json:"supportsCustomAgentNudgeTranscriptStep,omitempty"`
+	ThreadParentPointer                    *ThreadParentPointer `json:"threadParentPointer,omitempty"`
+	DebugOverrides                         DebugOverrides       `json:"debugOverrides"`
 }
 
 // ThreadParentPointer identifies the parent of a thread (used only on first turn)
@@ -194,8 +199,10 @@ type ResearcherTranscriptMsg struct {
 }
 
 type DebugOverrides struct {
-	Model                           string `json:"model,omitempty"`
-	EmitAgentSearchExtractedResults bool   `json:"emitAgentSearchExtractedResults,omitempty"`
+	EmitAgentSearchExtractedResults bool      `json:"emitAgentSearchExtractedResults,omitempty"`
+	CachedInferences                *struct{} `json:"cachedInferences,omitempty"`
+	AnnotationInferences            *struct{} `json:"annotationInferences,omitempty"`
+	EmitInferences                  *bool     `json:"emitInferences,omitempty"`
 }
 
 type NDJSONEvent struct {
