@@ -96,7 +96,7 @@ func TestBuildConfigValueMatchesModernWorkflowProtocol(t *testing.T) {
 
 	workspaceSearch := false
 	for _, isSubsequentTurn := range []bool{false, true} {
-		got := buildConfigValue("acai-budino-high", false, true, &workspaceSearch, false, false, isSubsequentTurn)
+		got := buildConfigValue("acai-budino-high", "", false, true, &workspaceSearch, false, false, isSubsequentTurn)
 		want := expectedModernWorkflowConfig(isSubsequentTurn)
 		if !reflect.DeepEqual(got, want) {
 			gotJSON, _ := json.Marshal(got)
@@ -106,13 +106,121 @@ func TestBuildConfigValueMatchesModernWorkflowProtocol(t *testing.T) {
 	}
 }
 
+func TestBuildConfigValueCarriesCapturedReasoningEffortForAllTurns(t *testing.T) {
+	previous := AppConfig
+	AppConfig = DefaultConfig()
+	defer func() { AppConfig = previous }()
+
+	for _, isSubsequentTurn := range []bool{false, true} {
+		got := buildConfigValue("strawberry-whoopiepie", "high", false, true, nil, false, false, isSubsequentTurn)
+		if got["reasoningEffort"] != "high" {
+			t.Fatalf("reasoningEffort(subsequent=%v) = %#v, want high", isSubsequentTurn, got["reasoningEffort"])
+		}
+	}
+
+	withoutEffort := buildConfigValue("strawberry-whoopiepie", "", false, true, nil, false, false, false)
+	if _, ok := withoutEffort["reasoningEffort"]; ok {
+		t.Fatalf("reasoningEffort unexpectedly present when the client omitted it")
+	}
+}
+
+func TestNormalizeReasoningEffort(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		value string
+		want  string
+	}{
+		{name: "empty", value: "", want: ""},
+		{name: "high normalized", value: " HIGH ", want: "high"},
+		{name: "native maximum", value: "max", want: "max"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := normalizeReasoningEffort(tc.value)
+			if err != nil {
+				t.Fatalf("normalizeReasoningEffort(%q) error = %v", tc.value, err)
+			}
+			if got != tc.want {
+				t.Fatalf("normalizeReasoningEffort(%q) = %q, want %q", tc.value, got, tc.want)
+			}
+		})
+	}
+
+	if _, err := normalizeReasoningEffort("auto"); err == nil {
+		t.Fatal("normalizeReasoningEffort(auto) unexpectedly succeeded")
+	}
+}
+
+func TestBuildWebSearchCallOptionsCarriesReasoningEffort(t *testing.T) {
+	got := buildWebSearchCallOptions("request-id", "high")
+	if !got.EnableWebSearch || got.ReasoningEffort != "high" || got.RequestID != "request-id" {
+		t.Fatalf("buildWebSearchCallOptions() = %#v", got)
+	}
+}
+
+func TestTranscriptJSONCarriesCapturedReasoningEffortForAllTurns(t *testing.T) {
+	previous := AppConfig
+	AppConfig = DefaultConfig()
+	defer func() { AppConfig = previous }()
+
+	account := protocolTestAccount()
+	full := buildFullTranscript(
+		account,
+		[]ChatMessage{{Role: "user", Content: "hello"}},
+		"strawberry-whoopiepie",
+		"high",
+		false,
+		true,
+		nil,
+		false,
+		nil,
+		"config-id",
+		"context-id",
+		"context-page-id",
+		"2026-08-05T01:02:03Z",
+	)
+	partial := buildPartialTranscript(account, "continue", "strawberry-whoopiepie", "high", false, true, nil, false, &Session{
+		ConfigID:         "config-id",
+		ContextID:        "context-id",
+		ContextPageID:    "context-page-id",
+		OriginalDatetime: "2026-08-05T01:02:03Z",
+	})
+
+	for name, transcript := range map[string][]interface{}{"full": full, "partial": partial} {
+		t.Run(name, func(t *testing.T) {
+			body, err := json.Marshal(NotionInferenceRequest{Transcript: transcript, ThreadType: "workflow"})
+			if err != nil {
+				t.Fatalf("json.Marshal() error = %v", err)
+			}
+			var got struct {
+				Transcript []struct {
+					Type  string          `json:"type"`
+					Value json.RawMessage `json:"value"`
+				} `json:"transcript"`
+			}
+			if err := json.Unmarshal(body, &got); err != nil {
+				t.Fatalf("json.Unmarshal() error = %v", err)
+			}
+			if len(got.Transcript) == 0 || got.Transcript[0].Type != "config" {
+				t.Fatalf("transcript[0] = %#v, want config", got.Transcript)
+			}
+			var config map[string]interface{}
+			if err := json.Unmarshal(got.Transcript[0].Value, &config); err != nil {
+				t.Fatalf("json.Unmarshal(transcript[0].value) error = %v", err)
+			}
+			if config["model"] != "strawberry-whoopiepie" || config["reasoningEffort"] != "high" || config["modelFromUser"] != true {
+				t.Fatalf("transcript[0].value = %#v", config)
+			}
+		})
+	}
+}
+
 func TestBuildConfigValuePreservesDynamicToolFlags(t *testing.T) {
 	previous := AppConfig
 	AppConfig = DefaultConfig()
 	defer func() { AppConfig = previous }()
 
 	workspaceSearch := false
-	got := buildConfigValue("acai-budino-high", true, false, &workspaceSearch, true, false, false)
+	got := buildConfigValue("acai-budino-high", "", true, false, &workspaceSearch, true, false, false)
 	for _, key := range []string{
 		"enableAgentAutomations",
 		"enableAgentIntegrations",
@@ -149,6 +257,7 @@ func TestBuildFullTranscriptUsesIndependentContextPageID(t *testing.T) {
 		account,
 		[]ChatMessage{{Role: "user", Content: "hello"}},
 		"acai-budino-high",
+		"",
 		false,
 		true,
 		nil,
@@ -197,6 +306,7 @@ func TestWorkflowRequestProtocolAttachmentSourceMatchesContext(t *testing.T) {
 		protocolTestAccount(),
 		[]ChatMessage{{Role: "user", Content: "summarize"}},
 		"acai-budino-high",
+		"",
 		false,
 		true,
 		nil,
@@ -241,7 +351,7 @@ func TestBuildPartialTranscriptUsesTwoContextsAndReusesContextPageID(t *testing.
 		UpdatedConfigIDs: []string{"updated-one", "updated-two"},
 	}
 
-	transcript := buildPartialTranscript(account, "next question", "acai-budino-high", false, true, nil, false, session)
+	transcript := buildPartialTranscript(account, "next question", "acai-budino-high", "", false, true, nil, false, session)
 	if len(transcript) != 6 {
 		t.Fatalf("transcript length = %d, want 6", len(transcript))
 	}
@@ -291,7 +401,7 @@ func TestBuildPartialTranscriptUsesTwoContextsAndReusesContextPageID(t *testing.
 	}
 
 	contextPageID := session.ContextPageID
-	buildPartialTranscript(account, "another question", "acai-budino-high", false, true, nil, false, session)
+	buildPartialTranscript(account, "another question", "acai-budino-high", "", false, true, nil, false, session)
 	if session.ContextPageID != contextPageID {
 		t.Fatalf("ContextPageID changed from %q to %q", contextPageID, session.ContextPageID)
 	}

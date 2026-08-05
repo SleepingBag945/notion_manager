@@ -47,7 +47,7 @@ func TestBuildConfigValueRespectsUseReadOnlyMode(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			cfg := buildConfigValue("avocado-froyo-medium", false, true, nil, tc.readOnly, false, false)
+			cfg := buildConfigValue("avocado-froyo-medium", "", false, true, nil, tc.readOnly, false, false)
 			got, ok := cfg["useReadOnlyMode"].(bool)
 			if !ok {
 				t.Fatalf("useReadOnlyMode missing or not bool: %#v", cfg["useReadOnlyMode"])
@@ -78,7 +78,7 @@ func TestBuildConfigValueSetsModelForAllTurns(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			cfg := buildConfigValue("acai-budino-high", false, true, nil, false, false, tt.isSubsequentTurn)
+			cfg := buildConfigValue("acai-budino-high", "", false, true, nil, false, false, tt.isSubsequentTurn)
 			if got := cfg["model"]; got != "acai-budino-high" {
 				t.Fatalf("model = %#v, want %q", got, "acai-budino-high")
 			}

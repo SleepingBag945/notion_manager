@@ -255,6 +255,7 @@ type CallOptions struct {
 	EnableWebSearch       bool                  // force useWebSearch=true in Notion config
 	EnableWorkspaceSearch *bool                 // override workspace search (nil = use config default)
 	UseReadOnlyMode       bool                  // ASK mode — Notion's workflow useReadOnlyMode=true (model answers but skips edits)
+	ReasoningEffort       string                // Notion workflow reasoningEffort (for example low, medium, or high)
 	Attachments           []UploadedAttachment  // uploaded file attachments to include in transcript
 	IsResearcher          bool                  // researcher mode (deep research)
 	ThinkingCallback      ThinkingDeltaCallback // incremental thinking/process callback for streaming

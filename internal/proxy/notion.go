@@ -164,10 +164,18 @@ func ResolveModel(model string) string {
 // StreamCallback is called for each text delta during streaming
 type StreamCallback func(delta string, done bool, usage *UsageInfo)
 
+func buildWebSearchCallOptions(requestID string, reasoningEffort string) CallOptions {
+	return CallOptions{
+		EnableWebSearch: true,
+		ReasoningEffort: reasoningEffort,
+		RequestID:       requestID,
+	}
+}
+
 // executeWebSearch runs a web search query via Notion's native search capability.
 // It makes a separate CallInference call with useWebSearch=true and no tool framing,
 // allowing Notion's model to use its built-in search tool (two-turn inference).
-func executeWebSearch(acc *Account, query string, model string, requestID string) (string, *UsageInfo, error) {
+func executeWebSearch(acc *Account, query string, model string, requestID string, reasoningEffort string) (string, *UsageInfo, error) {
 	var result strings.Builder
 	var finalUsage *UsageInfo
 	var knownCitationURLs []string
@@ -178,13 +186,10 @@ func executeWebSearch(acc *Account, query string, model string, requestID string
 		{Role: "user", Content: query},
 	}
 
-	callOpts := CallOptions{
-		EnableWebSearch:   true,
-		KnownCitationURLs: &knownCitationURLs,
-		KnownCitationDocs: &knownCitationDocs,
-		KnownToolCallURLs: &knownToolCallURLs,
-		RequestID:         requestID,
-	}
+	callOpts := buildWebSearchCallOptions(requestID, reasoningEffort)
+	callOpts.KnownCitationURLs = &knownCitationURLs
+	callOpts.KnownCitationDocs = &knownCitationDocs
+	callOpts.KnownToolCallURLs = &knownToolCallURLs
 
 	err := CallInference(acc, messages, model, false, func(delta string, done bool, usage *UsageInfo) {
 		if delta != "" {
@@ -1235,6 +1240,16 @@ func StripAskModeSuffix(model string) (string, bool) {
 	return model, false
 }
 
+func normalizeReasoningEffort(value string) (string, error) {
+	effort := strings.ToLower(strings.TrimSpace(value))
+	switch effort {
+	case "", "none", "minimal", "low", "medium", "high", "max", "xhigh":
+		return effort, nil
+	default:
+		return "", fmt.Errorf("unsupported reasoning effort %q", value)
+	}
+}
+
 // CallInference sends a request to Notion's runInferenceTranscript API
 // and streams the response via callback.
 // When opt.Session is non-nil with TurnCount > 0, it sends a partial transcript (subsequent turn).
@@ -1246,6 +1261,11 @@ func CallInference(acc *Account, messages []ChatMessage, model string, disableBu
 		opt = opts[0]
 	}
 	requestID := opt.RequestID
+	reasoningEffort, err := normalizeReasoningEffort(opt.ReasoningEffort)
+	if err != nil {
+		return err
+	}
+	opt.ReasoningEffort = reasoningEffort
 
 	// Per-request "-ask" suffix override. Defensive: most callers strip
 	// this in their own pipeline (anthropic.go does), but we re-check here
@@ -1283,7 +1303,7 @@ func CallInference(acc *Account, messages []ChatMessage, model string, disableBu
 		if newUserContent == "" {
 			newUserContent = "continue"
 		}
-		transcript := buildPartialTranscript(acc, newUserContent, notionModel, disableBuiltinTools, enableWebSearch, opt.EnableWorkspaceSearch, opt.UseReadOnlyMode, session)
+		transcript := buildPartialTranscript(acc, newUserContent, notionModel, opt.ReasoningEffort, disableBuiltinTools, enableWebSearch, opt.EnableWorkspaceSearch, opt.UseReadOnlyMode, session)
 
 		reqBody = NotionInferenceRequest{
 			TraceID:                 generateUUIDv4(),
@@ -1317,7 +1337,7 @@ func CallInference(acc *Account, messages []ChatMessage, model string, disableBu
 			contextPageID = generateUUIDv4()
 			now = time.Now().Format(time.RFC3339Nano)
 		}
-		transcript := buildFullTranscript(acc, messages, notionModel, disableBuiltinTools, enableWebSearch, opt.EnableWorkspaceSearch, opt.UseReadOnlyMode, attachments, configID, contextID, contextPageID, now)
+		transcript := buildFullTranscript(acc, messages, notionModel, opt.ReasoningEffort, disableBuiltinTools, enableWebSearch, opt.EnableWorkspaceSearch, opt.UseReadOnlyMode, attachments, configID, contextID, contextPageID, now)
 
 		// When attachments are present, reuse the upload thread instead of creating a new one.
 		createThread := true
@@ -1420,7 +1440,7 @@ func applyWorkflowRequestProtocol(reqBody *NotionInferenceRequest, createdSource
 // enableWorkspaceSearch: nil = use AppConfig default, non-nil = per-request override
 // useReadOnlyMode: when true, sets Notion's ASK-mode flag — model answers
 // the prompt but skips page edits. Mirrors the frontend's "Ask" mode toggle.
-func buildConfigValue(notionModel string, disableBuiltinTools bool, enableWebSearch bool, enableWorkspaceSearch *bool, useReadOnlyMode bool, hasAttachments bool, isSubsequentTurn bool) map[string]interface{} {
+func buildConfigValue(notionModel string, reasoningEffort string, disableBuiltinTools bool, enableWebSearch bool, enableWorkspaceSearch *bool, useReadOnlyMode bool, hasAttachments bool, isSubsequentTurn bool) map[string]interface{} {
 	effectiveDisable := disableBuiltinTools
 
 	// Resolve workspace search: per-request override > config default
@@ -1492,6 +1512,9 @@ func buildConfigValue(notionModel string, disableBuiltinTools bool, enableWebSea
 		"isOnboardingAgent":                              false,
 		"isMobile":                                       false,
 	}
+	if reasoningEffort != "" {
+		configValue["reasoningEffort"] = reasoningEffort
+	}
 
 	// searchScopes controls what the built-in search tool can access
 	if wsSearch || enableWebSearch {
@@ -1531,9 +1554,9 @@ func buildContextValue(acc *Account, datetime, contextPageID string) map[string]
 
 // buildFullTranscript builds a complete transcript for the first turn of a conversation.
 // Uses ResearcherTranscriptMsg (with id field) to match Notion's real client format.
-func buildFullTranscript(acc *Account, messages []ChatMessage, notionModel string, disableBuiltinTools bool, enableWebSearch bool, enableWorkspaceSearch *bool, useReadOnlyMode bool, attachments []UploadedAttachment, configID, contextID, contextPageID, now string) []interface{} {
+func buildFullTranscript(acc *Account, messages []ChatMessage, notionModel string, reasoningEffort string, disableBuiltinTools bool, enableWebSearch bool, enableWorkspaceSearch *bool, useReadOnlyMode bool, attachments []UploadedAttachment, configID, contextID, contextPageID, now string) []interface{} {
 	hasAttachments := len(attachments) > 0
-	configValue := buildConfigValue(notionModel, disableBuiltinTools, enableWebSearch, enableWorkspaceSearch, useReadOnlyMode, hasAttachments, false)
+	configValue := buildConfigValue(notionModel, reasoningEffort, disableBuiltinTools, enableWebSearch, enableWorkspaceSearch, useReadOnlyMode, hasAttachments, false)
 	contextValue := buildContextValue(acc, now, contextPageID)
 
 	if hasAttachments {
@@ -1611,8 +1634,8 @@ func buildFullTranscript(acc *Account, messages []ChatMessage, notionModel strin
 
 // buildPartialTranscript builds an incremental transcript for subsequent turns.
 // It includes: config + context (reused IDs) + N updated-config placeholders + new user message.
-func buildPartialTranscript(acc *Account, newUserContent string, notionModel string, disableBuiltinTools bool, enableWebSearch bool, enableWorkspaceSearch *bool, useReadOnlyMode bool, session *Session) []interface{} {
-	configValue := buildConfigValue(notionModel, disableBuiltinTools, enableWebSearch, enableWorkspaceSearch, useReadOnlyMode, false, true)
+func buildPartialTranscript(acc *Account, newUserContent string, notionModel string, reasoningEffort string, disableBuiltinTools bool, enableWebSearch bool, enableWorkspaceSearch *bool, useReadOnlyMode bool, session *Session) []interface{} {
+	configValue := buildConfigValue(notionModel, reasoningEffort, disableBuiltinTools, enableWebSearch, enableWorkspaceSearch, useReadOnlyMode, false, true)
 	contextPageID := ensureSessionContextPageID(session)
 	contextValue := buildContextValue(acc, session.OriginalDatetime, contextPageID)
 	currentDatetime := time.Now().Format(time.RFC3339Nano)

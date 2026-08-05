@@ -92,6 +92,7 @@ type OpenAIChatCompletionRequest struct {
 	Model               string                     `json:"model"`
 	Messages            []OpenAIChatMessage        `json:"messages"`
 	PromptCacheKey      string                     `json:"prompt_cache_key,omitempty"`
+	ReasoningEffort     string                     `json:"reasoning_effort,omitempty"`
 	Stream              bool                       `json:"stream,omitempty"`
 	Tools               []OpenAITool               `json:"tools,omitempty"`
 	ToolChoice          interface{}                `json:"tool_choice,omitempty"`
@@ -126,10 +127,15 @@ type OpenAIResponsesTextConfig struct {
 	Format *OpenAIChatResponseFormat `json:"format,omitempty"`
 }
 
+type OpenAIReasoningConfig struct {
+	Effort string `json:"effort,omitempty"`
+}
+
 type OpenAIResponsesRequest struct {
 	Model              string                     `json:"model"`
 	Input              interface{}                `json:"input"`
 	PromptCacheKey     string                     `json:"prompt_cache_key,omitempty"`
+	Reasoning          *OpenAIReasoningConfig     `json:"reasoning,omitempty"`
 	Stream             bool                       `json:"stream,omitempty"`
 	Tools              []OpenAITool               `json:"tools,omitempty"`
 	ToolChoice         interface{}                `json:"tool_choice,omitempty"`
@@ -1307,7 +1313,7 @@ func convertOpenAIChatCompletionRequest(req *OpenAIChatCompletionRequest) (*Anth
 		TopP:         req.TopP,
 		Tools:        tools,
 		ToolChoice:   normalizeOpenAIToolChoice(req.ToolChoice, req.FunctionCall),
-		OutputConfig: convertOpenAIResponseFormat(req.ResponseFormat),
+		OutputConfig: mergeOpenAIOutputConfigEffort(convertOpenAIResponseFormat(req.ResponseFormat), req.ReasoningEffort),
 		Metadata:     openAIMetadataWithPromptCacheKey(req.Metadata, req.PromptCacheKey),
 	}
 	return anthReq, nil
@@ -1341,6 +1347,10 @@ func convertOpenAIResponsesRequestWithToolAliases(req *OpenAIResponsesRequest) (
 	if len(messages) == 0 {
 		return nil, nil, fmt.Errorf("input is required")
 	}
+	reasoningEffort := ""
+	if req.Reasoning != nil {
+		reasoningEffort = req.Reasoning.Effort
+	}
 	return &AnthropicRequest{
 		Model:        model,
 		MaxTokens:    req.MaxOutputTokens,
@@ -1351,7 +1361,7 @@ func convertOpenAIResponsesRequestWithToolAliases(req *OpenAIResponsesRequest) (
 		TopP:         req.TopP,
 		Tools:        toolConversion.Tools,
 		ToolChoice:   toolChoice,
-		OutputConfig: convertOpenAIResponsesTextFormat(req.Text),
+		OutputConfig: mergeOpenAIOutputConfigEffort(convertOpenAIResponsesTextFormat(req.Text), reasoningEffort),
 		Metadata:     openAIMetadataWithPromptCacheKey(req.Metadata, req.PromptCacheKey),
 	}, toolConversion.Aliases, nil
 }
@@ -2185,6 +2195,18 @@ func convertOpenAIResponsesTextFormat(textCfg *OpenAIResponsesTextConfig) *Anthr
 		return nil
 	}
 	return convertOpenAIResponseFormat(textCfg.Format)
+}
+
+func mergeOpenAIOutputConfigEffort(outputConfig *AnthropicOutputConfig, effort string) *AnthropicOutputConfig {
+	effort = strings.TrimSpace(effort)
+	if outputConfig == nil && effort == "" {
+		return nil
+	}
+	if outputConfig == nil {
+		outputConfig = &AnthropicOutputConfig{}
+	}
+	outputConfig.Effort = effort
+	return outputConfig
 }
 
 func looseJSONObjectSchema() interface{} {

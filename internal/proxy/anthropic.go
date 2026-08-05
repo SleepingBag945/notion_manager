@@ -195,7 +195,7 @@ func renderAnthropicCitationText(rawText string, knownURLs []string, knownDocs [
 // It replaces inline citations [^{{URL}}] with [N] in real-time using
 // a buffered state machine, emits thinking blocks as they arrive,
 // then appends a Sources section.
-func streamWebSearch(w http.ResponseWriter, flusher http.Flusher, acc *Account, query string, model string, requestID string, blockIndex *int, hasThinking bool) (*UsageInfo, error) {
+func streamWebSearch(w http.ResponseWriter, flusher http.Flusher, acc *Account, query string, model string, requestID string, blockIndex *int, hasThinking bool, reasoningEffort string) (*UsageInfo, error) {
 	var finalUsage *UsageInfo
 	var thinkingBlocks []ThinkingBlock
 	var streamedText strings.Builder
@@ -209,14 +209,11 @@ func streamWebSearch(w http.ResponseWriter, flusher http.Flusher, acc *Account, 
 	messages := []ChatMessage{
 		{Role: "user", Content: query},
 	}
-	callOpts := CallOptions{
-		EnableWebSearch:   true,
-		ThinkingBlocks:    &thinkingBlocks,
-		KnownCitationURLs: &knownCitationURLs,
-		KnownCitationDocs: &knownCitationDocs,
-		KnownToolCallURLs: &knownToolCallURLs,
-		RequestID:         requestID,
-	}
+	callOpts := buildWebSearchCallOptions(requestID, reasoningEffort)
+	callOpts.ThinkingBlocks = &thinkingBlocks
+	callOpts.KnownCitationURLs = &knownCitationURLs
+	callOpts.KnownCitationDocs = &knownCitationDocs
+	callOpts.KnownToolCallURLs = &knownToolCallURLs
 
 	// emitPendingThinking emits any thinking blocks that have been collected
 	// since the last check. Called before first text delta to ensure thinking
@@ -436,6 +433,13 @@ var structuredOutputLeadingTagRegex = regexp.MustCompile(`(?s)^\s*(?:<[A-Za-z][^
 
 func isJSONSchemaOutput(outputConfig *AnthropicOutputConfig) bool {
 	return outputConfig != nil && outputConfig.Format != nil && outputConfig.Format.Type == "json_schema" && outputConfig.Format.Schema != nil
+}
+
+func outputConfigReasoningEffort(outputConfig *AnthropicOutputConfig) string {
+	if outputConfig == nil {
+		return ""
+	}
+	return outputConfig.Effort
 }
 
 func extractStructuredJSONObject(content string) string {
@@ -770,6 +774,14 @@ func HandleAnthropicMessages(pool *AccountPool) http.HandlerFunc {
 		if len(req.Messages) == 0 {
 			writeAnthropicError(w, requestID, http.StatusBadRequest, "messages is required", "invalid_request_error")
 			return
+		}
+		if req.OutputConfig != nil {
+			reasoningEffort, err := normalizeReasoningEffort(req.OutputConfig.Effort)
+			if err != nil {
+				writeAnthropicError(w, requestID, http.StatusBadRequest, err.Error(), "invalid_request_error")
+				return
+			}
+			req.OutputConfig.Effort = reasoningEffort
 		}
 
 		model := req.Model
@@ -1704,6 +1716,7 @@ func handleAnthropicStream(w http.ResponseWriter, acc *Account, messages []ChatM
 		EnableWebSearch:       enableWebSearch,
 		EnableWorkspaceSearch: enableWorkspaceSearch,
 		UseReadOnlyMode:       useReadOnlyMode,
+		ReasoningEffort:       outputConfigReasoningEffort(outputConfig),
 		Attachments:           attachments,
 		KnownCitationURLs:     &knownCitationURLs,
 		KnownCitationDocs:     &knownCitationDocs,
@@ -1888,7 +1901,7 @@ func handleAnthropicStream(w http.ResponseWriter, acc *Account, messages []ChatM
 		// Stream WebSearch results in real-time (after text blocks, before tool_use)
 		if webSearchQuery != "" {
 			log.Printf("[bridge] WebSearch intercepted — streaming via Notion native search: %q", webSearchQuery)
-			searchUsage, searchErr := streamWebSearch(w, flusher, acc, webSearchQuery, model, requestID, &blockIndex, hasThinking)
+			searchUsage, searchErr := streamWebSearch(w, flusher, acc, webSearchQuery, model, requestID, &blockIndex, hasThinking, outputConfigReasoningEffort(outputConfig))
 			if searchErr != nil {
 				log.Printf("[bridge] WebSearch streaming failed: %v", searchErr)
 			}
@@ -1982,6 +1995,7 @@ func handleAnthropicNonStream(w http.ResponseWriter, acc *Account, messages []Ch
 		EnableWebSearch:       enableWebSearch,
 		EnableWorkspaceSearch: enableWorkspaceSearch,
 		UseReadOnlyMode:       useReadOnlyMode,
+		ReasoningEffort:       outputConfigReasoningEffort(outputConfig),
 		Attachments:           attachments,
 		KnownCitationURLs:     &knownCitationURLs,
 		KnownCitationDocs:     &knownCitationDocs,
@@ -2093,7 +2107,7 @@ func handleAnthropicNonStream(w http.ResponseWriter, acc *Account, messages []Ch
 		// Intercept WebSearch tool calls → execute via Notion's native search
 		if prepared.WebSearchQuery != "" {
 			log.Printf("[bridge] WebSearch intercepted — executing via Notion native search: %q", prepared.WebSearchQuery)
-			searchResult, searchUsage, searchErr := executeWebSearch(acc, prepared.WebSearchQuery, model, requestID)
+			searchResult, searchUsage, searchErr := executeWebSearch(acc, prepared.WebSearchQuery, model, requestID, outputConfigReasoningEffort(outputConfig))
 			if searchErr == nil && searchResult != "" {
 				if doneText != "" {
 					doneText = doneText + "\n\n" + searchResult

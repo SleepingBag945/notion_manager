@@ -87,6 +87,39 @@ func TestConvertOpenAIChatCompletionRequest_WithFilesToolsAndJSONSchema(t *testi
 	}
 }
 
+func TestConvertOpenAIChatCompletionRequestPreservesReasoningEffortAndResponseFormat(t *testing.T) {
+	var req OpenAIChatCompletionRequest
+	err := json.Unmarshal([]byte(`{
+		"model":"gpt-5.4",
+		"messages":[{"role":"user","content":"hello"}],
+		"reasoning_effort":"high",
+		"response_format":{"type":"json_object"}
+	}`), &req)
+	if err != nil {
+		t.Fatalf("json.Unmarshal() error = %v", err)
+	}
+
+	anthReq, err := convertOpenAIChatCompletionRequest(&req)
+	if err != nil {
+		t.Fatalf("convertOpenAIChatCompletionRequest() error = %v", err)
+	}
+	if anthReq.OutputConfig == nil || anthReq.OutputConfig.Effort != "high" {
+		t.Fatalf("output_config effort = %#v", anthReq.OutputConfig)
+	}
+	if anthReq.OutputConfig.Format == nil || anthReq.OutputConfig.Format.Type != "json_schema" {
+		t.Fatalf("output_config format = %#v", anthReq.OutputConfig)
+	}
+
+	req.ResponseFormat = nil
+	anthReq, err = convertOpenAIChatCompletionRequest(&req)
+	if err != nil {
+		t.Fatalf("convertOpenAIChatCompletionRequest() without response_format error = %v", err)
+	}
+	if anthReq.OutputConfig == nil || anthReq.OutputConfig.Effort != "high" || anthReq.OutputConfig.Format != nil {
+		t.Fatalf("output_config without response_format = %#v", anthReq.OutputConfig)
+	}
+}
+
 func TestConvertOpenAIResponsesRequest_WithFunctionCallOutput(t *testing.T) {
 	req := &OpenAIResponsesRequest{
 		Model:          "gpt-5.4",
@@ -123,6 +156,39 @@ func TestConvertOpenAIResponsesRequest_WithFunctionCallOutput(t *testing.T) {
 	toolResult := secondBlocks[0].(map[string]interface{})
 	if toolResult["type"] != "tool_result" || toolResult["tool_use_id"] != "call_123" {
 		t.Fatalf("tool result = %#v", toolResult)
+	}
+}
+
+func TestConvertOpenAIResponsesRequestPreservesReasoningEffortAndTextFormat(t *testing.T) {
+	var req OpenAIResponsesRequest
+	err := json.Unmarshal([]byte(`{
+		"model":"gpt-5.4",
+		"input":"hello",
+		"reasoning":{"effort":"high"},
+		"text":{"format":{"type":"json_object"}}
+	}`), &req)
+	if err != nil {
+		t.Fatalf("json.Unmarshal() error = %v", err)
+	}
+
+	anthReq, err := convertOpenAIResponsesRequest(&req)
+	if err != nil {
+		t.Fatalf("convertOpenAIResponsesRequest() error = %v", err)
+	}
+	if anthReq.OutputConfig == nil || anthReq.OutputConfig.Effort != "high" {
+		t.Fatalf("output_config effort = %#v", anthReq.OutputConfig)
+	}
+	if anthReq.OutputConfig.Format == nil || anthReq.OutputConfig.Format.Type != "json_schema" {
+		t.Fatalf("output_config format = %#v", anthReq.OutputConfig)
+	}
+
+	req.Text = nil
+	anthReq, err = convertOpenAIResponsesRequest(&req)
+	if err != nil {
+		t.Fatalf("convertOpenAIResponsesRequest() without text format error = %v", err)
+	}
+	if anthReq.OutputConfig == nil || anthReq.OutputConfig.Effort != "high" || anthReq.OutputConfig.Format != nil {
+		t.Fatalf("output_config without text format = %#v", anthReq.OutputConfig)
 	}
 }
 
