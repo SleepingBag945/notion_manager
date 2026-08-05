@@ -354,6 +354,7 @@ type FileAttachment struct {
 // because Notion's attachment format differs from config/context/user entries.
 type AttachmentTranscriptMsg struct {
 	Type        string             `json:"type"`        // "attachment"
+	ID          string             `json:"id"`          // independent transcript record ID
 	FileUrl     string             `json:"fileUrl"`     // attachment:UUID:filename
 	FileName    string             `json:"fileName"`    // original filename
 	ContentType string             `json:"contentType"` // MIME type

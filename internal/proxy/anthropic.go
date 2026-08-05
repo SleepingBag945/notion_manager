@@ -1059,10 +1059,12 @@ func HandleAnthropicMessages(pool *AccountPool) http.HandlerFunc {
 			// Upload file attachments to Notion (if any) — skip for researcher mode
 			var uploadedAttachments []UploadedAttachment
 			if !isResearcher && len(fileAttachments) > 0 {
+				uploadPlan := buildAttachmentUploadPlan(currentSession.ThreadID, len(fileAttachments), isFirstTurn)
 				for i, fa := range fileAttachments {
+					target := uploadPlan[i]
 					log.Printf("[upload-debug] %s: uploading attachment %d/%d: %s (%s, %d bytes)",
 						requestID, i+1, len(fileAttachments), fa.FileName, fa.ContentType, len(fa.Data))
-					uploaded, err := UploadFileToNotion(acc, &fa)
+					uploaded, err := UploadFileToNotionThread(acc, &fa, target.ThreadID, target.CreateThread)
 					if err != nil {
 						log.Printf("[upload] %s: attachment %d upload failed: %v", requestID, i+1, err)
 						writeAnthropicError(w, requestID, http.StatusBadGateway, "file upload failed: "+err.Error(), "api_error")

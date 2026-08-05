@@ -85,6 +85,17 @@ func TestConvertOpenAIChatCompletionRequest_WithFilesToolsAndJSONSchema(t *testi
 	if third["type"] != "document" {
 		t.Fatalf("third block = %#v", third)
 	}
+
+	_, attachments := convertAnthropicMessages(anthReq.System, anthReq.Messages)
+	if len(attachments) != 2 {
+		t.Fatalf("attachments len = %d, want 2", len(attachments))
+	}
+	if string(attachments[0].Data) != "png-bytes" || attachments[0].ContentType != "image/png" {
+		t.Fatalf("image attachment = %#v", attachments[0])
+	}
+	if string(attachments[1].Data) != "%PDF-1.4 mock" || attachments[1].ContentType != "application/pdf" {
+		t.Fatalf("document attachment = %#v", attachments[1])
+	}
 }
 
 func TestConvertOpenAIChatCompletionRequestPreservesReasoningEffortAndResponseFormat(t *testing.T) {

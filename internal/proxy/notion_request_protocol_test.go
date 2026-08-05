@@ -178,7 +178,7 @@ func TestTranscriptJSONCarriesCapturedReasoningEffortForAllTurns(t *testing.T) {
 		"context-page-id",
 		"2026-08-05T01:02:03Z",
 	)
-	partial := buildPartialTranscript(account, "continue", "strawberry-whoopiepie", "high", false, true, nil, false, &Session{
+	partial := buildPartialTranscript(account, "continue", "strawberry-whoopiepie", "high", false, true, nil, false, nil, &Session{
 		ConfigID:         "config-id",
 		ContextID:        "context-id",
 		ContextPageID:    "context-page-id",
@@ -317,10 +317,21 @@ func TestWorkflowRequestProtocolAttachmentSourceMatchesContext(t *testing.T) {
 		"context-page-id",
 		"2026-08-03T01:02:03Z",
 	)
+	if len(transcript) != 4 {
+		t.Fatalf("transcript length = %d, want config + context + attachment + user", len(transcript))
+	}
 	context := requireResearcherTranscriptMsg(t, transcript[1], "context")
 	contextSource, ok := requireTranscriptValueMap(t, context)["surface"].(string)
 	if !ok || contextSource != "workflows" {
 		t.Fatalf("attachment context source = %#v, want workflows", contextSource)
+	}
+	attachment, ok := transcript[2].(AttachmentTranscriptMsg)
+	if !ok || attachment.ID == "" || attachment.Metadata.Guardrail == nil || attachment.Metadata.Guardrail.AttachmentRisk != "skipped" {
+		t.Fatalf("attachment transcript = %#v, want native attachment fields", transcript[2])
+	}
+	user := requireResearcherTranscriptMsg(t, transcript[3], "user")
+	if user.Value == nil {
+		t.Fatal("user transcript unexpectedly empty after attachment")
 	}
 
 	reqBody := NotionInferenceRequest{Transcript: transcript, ThreadType: "workflow"}
@@ -351,7 +362,7 @@ func TestBuildPartialTranscriptUsesTwoContextsAndReusesContextPageID(t *testing.
 		UpdatedConfigIDs: []string{"updated-one", "updated-two"},
 	}
 
-	transcript := buildPartialTranscript(account, "next question", "acai-budino-high", "", false, true, nil, false, session)
+	transcript := buildPartialTranscript(account, "next question", "acai-budino-high", "", false, true, nil, false, nil, session)
 	if len(transcript) != 6 {
 		t.Fatalf("transcript length = %d, want 6", len(transcript))
 	}
@@ -401,7 +412,7 @@ func TestBuildPartialTranscriptUsesTwoContextsAndReusesContextPageID(t *testing.
 	}
 
 	contextPageID := session.ContextPageID
-	buildPartialTranscript(account, "another question", "acai-budino-high", "", false, true, nil, false, session)
+	buildPartialTranscript(account, "another question", "acai-budino-high", "", false, true, nil, false, nil, session)
 	if session.ContextPageID != contextPageID {
 		t.Fatalf("ContextPageID changed from %q to %q", contextPageID, session.ContextPageID)
 	}

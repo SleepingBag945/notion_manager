@@ -1250,6 +1250,44 @@ func normalizeReasoningEffort(value string) (string, error) {
 	}
 }
 
+func uploadedAttachmentThreadID(attachments []UploadedAttachment) (string, error) {
+	var threadID string
+	for i, attachment := range attachments {
+		candidate := strings.TrimSpace(attachment.SessionID)
+		if candidate == "" {
+			return "", fmt.Errorf("attachment %d is missing its upload thread ID", i+1)
+		}
+		if threadID == "" {
+			threadID = candidate
+			continue
+		}
+		if candidate != threadID {
+			return "", fmt.Errorf("attachment %d upload thread %q does not match %q", i+1, candidate, threadID)
+		}
+	}
+	return threadID, nil
+}
+
+func resolveFirstTurnInferenceThread(session *Session, attachmentThreadID string) (string, bool, error) {
+	if session != nil {
+		if attachmentThreadID != "" && attachmentThreadID != session.ThreadID {
+			return "", false, fmt.Errorf("attachment upload thread %q does not match session thread %q", attachmentThreadID, session.ThreadID)
+		}
+		return session.ThreadID, attachmentThreadID == "", nil
+	}
+	if attachmentThreadID != "" {
+		return attachmentThreadID, false, nil
+	}
+	return generateUUIDv4(), true, nil
+}
+
+func inferenceCreatedSource(hasAttachments bool) string {
+	if hasAttachments {
+		return "workflows"
+	}
+	return "ai_module"
+}
+
 // CallInference sends a request to Notion's runInferenceTranscript API
 // and streams the response via callback.
 // When opt.Session is non-nil with TurnCount > 0, it sends a partial transcript (subsequent turn).
@@ -1293,17 +1331,24 @@ func CallInference(acc *Account, messages []ChatMessage, model string, disableBu
 	enableWebSearch := opt.EnableWebSearch
 	attachments := opt.Attachments
 	session := opt.Session
+	attachmentThreadID, err := uploadedAttachmentThreadID(attachments)
+	if err != nil {
+		return err
+	}
 
 	var reqBody NotionInferenceRequest
-	createdSource := "ai_module"
+	createdSource := inferenceCreatedSource(attachmentThreadID != "")
 
 	if session != nil && session.TurnCount > 0 {
 		// ── Subsequent turn: partial transcript ──
+		if attachmentThreadID != "" && attachmentThreadID != session.ThreadID {
+			return fmt.Errorf("attachment upload thread %q does not match session thread %q", attachmentThreadID, session.ThreadID)
+		}
 		newUserContent := extractLastUserMessage(messages)
 		if newUserContent == "" {
 			newUserContent = "continue"
 		}
-		transcript := buildPartialTranscript(acc, newUserContent, notionModel, opt.ReasoningEffort, disableBuiltinTools, enableWebSearch, opt.EnableWorkspaceSearch, opt.UseReadOnlyMode, session)
+		transcript := buildPartialTranscript(acc, newUserContent, notionModel, opt.ReasoningEffort, disableBuiltinTools, enableWebSearch, opt.EnableWorkspaceSearch, opt.UseReadOnlyMode, attachments, session)
 
 		reqBody = NotionInferenceRequest{
 			TraceID:                 generateUUIDv4(),
@@ -1320,9 +1365,6 @@ func CallInference(acc *Account, messages []ChatMessage, model string, disableBu
 			session.TurnCount+1, session.ThreadID, len(session.UpdatedConfigIDs))
 	} else {
 		// ── First turn (or legacy single-turn): full transcript ──
-		if len(attachments) > 0 {
-			createdSource = "workflows"
-		}
 		var configID, contextID, contextPageID, now string
 		if session != nil {
 			// Pre-created session from HandleAnthropicMessages
@@ -1340,16 +1382,12 @@ func CallInference(acc *Account, messages []ChatMessage, model string, disableBu
 		transcript := buildFullTranscript(acc, messages, notionModel, opt.ReasoningEffort, disableBuiltinTools, enableWebSearch, opt.EnableWorkspaceSearch, opt.UseReadOnlyMode, attachments, configID, contextID, contextPageID, now)
 
 		// When attachments are present, reuse the upload thread instead of creating a new one.
-		createThread := true
-		var threadID string
-		if len(attachments) > 0 && attachments[0].SessionID != "" {
-			threadID = attachments[0].SessionID
-			createThread = false
+		threadID, createThread, err := resolveFirstTurnInferenceThread(session, attachmentThreadID)
+		if err != nil {
+			return err
+		}
+		if !createThread {
 			log.Printf("[upload] using upload thread %s for inference", threadID)
-		} else if session != nil {
-			threadID = session.ThreadID
-		} else {
-			threadID = generateUUIDv4()
 		}
 
 		reqBody = NotionInferenceRequest{
@@ -1633,9 +1671,9 @@ func buildFullTranscript(acc *Account, messages []ChatMessage, notionModel strin
 }
 
 // buildPartialTranscript builds an incremental transcript for subsequent turns.
-// It includes: config + context (reused IDs) + N updated-config placeholders + new user message.
-func buildPartialTranscript(acc *Account, newUserContent string, notionModel string, reasoningEffort string, disableBuiltinTools bool, enableWebSearch bool, enableWorkspaceSearch *bool, useReadOnlyMode bool, session *Session) []interface{} {
-	configValue := buildConfigValue(notionModel, reasoningEffort, disableBuiltinTools, enableWebSearch, enableWorkspaceSearch, useReadOnlyMode, false, true)
+// It includes: config + context (reused IDs) + N updated-config placeholders + attachments + new user message.
+func buildPartialTranscript(acc *Account, newUserContent string, notionModel string, reasoningEffort string, disableBuiltinTools bool, enableWebSearch bool, enableWorkspaceSearch *bool, useReadOnlyMode bool, attachments []UploadedAttachment, session *Session) []interface{} {
+	configValue := buildConfigValue(notionModel, reasoningEffort, disableBuiltinTools, enableWebSearch, enableWorkspaceSearch, useReadOnlyMode, len(attachments) > 0, true)
 	contextPageID := ensureSessionContextPageID(session)
 	contextValue := buildContextValue(acc, session.OriginalDatetime, contextPageID)
 	currentDatetime := time.Now().Format(time.RFC3339Nano)
@@ -1666,6 +1704,9 @@ func buildPartialTranscript(acc *Account, newUserContent string, notionModel str
 			ID:   ucID,
 			Type: "updated-config",
 		})
+	}
+	for i := range attachments {
+		transcript = append(transcript, BuildAttachmentTranscript(&attachments[i]))
 	}
 
 	// Add the new user message
