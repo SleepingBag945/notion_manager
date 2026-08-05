@@ -150,19 +150,24 @@ type UsageInfo struct {
 // ========== Notion API Types ==========
 
 type NotionInferenceRequest struct {
-	TraceID                 string               `json:"traceId"`
-	SpaceID                 string               `json:"spaceId"`
-	ThreadID                string               `json:"threadId,omitempty"`
-	Transcript              []interface{}        `json:"transcript"`
-	CreateThread            bool                 `json:"createThread"`
-	GenerateTitle           bool                 `json:"generateTitle"`
-	SaveAllThreadOperations bool                 `json:"saveAllThreadOperations"`
-	SetUnreadState          bool                 `json:"setUnreadState"`
-	ThreadType              string               `json:"threadType"`
-	AsPatchResponse         bool                 `json:"asPatchResponse"`
-	IsPartialTranscript     bool                 `json:"isPartialTranscript"`
-	ThreadParentPointer     *ThreadParentPointer `json:"threadParentPointer,omitempty"`
-	DebugOverrides          DebugOverrides       `json:"debugOverrides"`
+	TraceID                                string               `json:"traceId"`
+	SpaceID                                string               `json:"spaceId"`
+	ThreadID                               string               `json:"threadId,omitempty"`
+	Transcript                             []interface{}        `json:"transcript"`
+	CreateThread                           bool                 `json:"createThread"`
+	GenerateTitle                          bool                 `json:"generateTitle"`
+	SaveAllThreadOperations                bool                 `json:"saveAllThreadOperations"`
+	SetUnreadState                         bool                 `json:"setUnreadState"`
+	ThreadType                             string               `json:"threadType"`
+	CreatedSource                          string               `json:"createdSource,omitempty"`
+	AsPatchResponse                        bool                 `json:"asPatchResponse"`
+	PatchResponseVersion                   int                  `json:"patchResponseVersion,omitempty"`
+	IsPartialTranscript                    bool                 `json:"isPartialTranscript"`
+	IsUserInAnySalesAssistedSpace          *bool                `json:"isUserInAnySalesAssistedSpace,omitempty"`
+	IsSpaceSalesAssisted                   *bool                `json:"isSpaceSalesAssisted,omitempty"`
+	SupportsCustomAgentNudgeTranscriptStep *bool                `json:"supportsCustomAgentNudgeTranscriptStep,omitempty"`
+	ThreadParentPointer                    *ThreadParentPointer `json:"threadParentPointer,omitempty"`
+	DebugOverrides                         DebugOverrides       `json:"debugOverrides"`
 }
 
 // ThreadParentPointer identifies the parent of a thread (used only on first turn)
@@ -194,8 +199,10 @@ type ResearcherTranscriptMsg struct {
 }
 
 type DebugOverrides struct {
-	Model                           string `json:"model,omitempty"`
-	EmitAgentSearchExtractedResults bool   `json:"emitAgentSearchExtractedResults,omitempty"`
+	EmitAgentSearchExtractedResults bool      `json:"emitAgentSearchExtractedResults,omitempty"`
+	CachedInferences                *struct{} `json:"cachedInferences,omitempty"`
+	AnnotationInferences            *struct{} `json:"annotationInferences,omitempty"`
+	EmitInferences                  *bool     `json:"emitInferences,omitempty"`
 }
 
 type NDJSONEvent struct {
@@ -248,6 +255,7 @@ type CallOptions struct {
 	EnableWebSearch       bool                  // force useWebSearch=true in Notion config
 	EnableWorkspaceSearch *bool                 // override workspace search (nil = use config default)
 	UseReadOnlyMode       bool                  // ASK mode — Notion's workflow useReadOnlyMode=true (model answers but skips edits)
+	ReasoningEffort       string                // Notion workflow reasoningEffort (for example low, medium, or high)
 	Attachments           []UploadedAttachment  // uploaded file attachments to include in transcript
 	IsResearcher          bool                  // researcher mode (deep research)
 	ThinkingCallback      ThinkingDeltaCallback // incremental thinking/process callback for streaming
@@ -346,6 +354,7 @@ type FileAttachment struct {
 // because Notion's attachment format differs from config/context/user entries.
 type AttachmentTranscriptMsg struct {
 	Type        string             `json:"type"`        // "attachment"
+	ID          string             `json:"id"`          // independent transcript record ID
 	FileUrl     string             `json:"fileUrl"`     // attachment:UUID:filename
 	FileName    string             `json:"fileName"`    // original filename
 	ContentType string             `json:"contentType"` // MIME type

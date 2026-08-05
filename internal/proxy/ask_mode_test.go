@@ -47,7 +47,7 @@ func TestBuildConfigValueRespectsUseReadOnlyMode(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			cfg := buildConfigValue("avocado-froyo-medium", false, true, nil, tc.readOnly, false, false)
+			cfg := buildConfigValue("avocado-froyo-medium", "", false, true, nil, tc.readOnly, false, false)
 			got, ok := cfg["useReadOnlyMode"].(bool)
 			if !ok {
 				t.Fatalf("useReadOnlyMode missing or not bool: %#v", cfg["useReadOnlyMode"])
@@ -57,6 +57,33 @@ func TestBuildConfigValueRespectsUseReadOnlyMode(t *testing.T) {
 			}
 			if cfg["type"] != "workflow" {
 				t.Fatalf("expected type=workflow, got %#v", cfg["type"])
+			}
+		})
+	}
+}
+
+func TestBuildConfigValueSetsModelForAllTurns(t *testing.T) {
+	prev := AppConfig
+	AppConfig = DefaultConfig()
+	defer func() { AppConfig = prev }()
+
+	tests := []struct {
+		name              string
+		isSubsequentTurn  bool
+		wantModelFromUser bool
+	}{
+		{name: "first turn", isSubsequentTurn: false, wantModelFromUser: true},
+		{name: "subsequent turn", isSubsequentTurn: true, wantModelFromUser: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := buildConfigValue("acai-budino-high", "", false, true, nil, false, false, tt.isSubsequentTurn)
+			if got := cfg["model"]; got != "acai-budino-high" {
+				t.Fatalf("model = %#v, want %q", got, "acai-budino-high")
+			}
+			if got := cfg["modelFromUser"]; got != tt.wantModelFromUser {
+				t.Fatalf("modelFromUser = %#v, want %v", got, tt.wantModelFromUser)
 			}
 		})
 	}

@@ -38,6 +38,22 @@
 - `API gateway` — `POST /v1/messages` (Anthropic), `POST /v1/chat/completions`, `POST /v1/responses`, `GET /v1/models` (OpenAI), with `GET /models` as an alias
 - `Bulk register` at `POST /admin/register/start` (provider-pluggable)
 
+### Environment startup accounts
+
+Set `NOTION_TOKEN_V2` to discover and persist an account at startup. For
+browser sessions containing multiple Notion accounts, the optional
+`NOTION_ACTIVE_USER_ID`, `NOTION_SPACE_ID`, and `NOTION_EXPECTED_EMAIL`
+selectors pin discovery to the intended account and workspace.
+
+Up to 15 additional accounts can be imported at startup with
+`NOTION_TOKEN_V2_2` through `NOTION_TOKEN_V2_16`. Each additional account has
+its own optional selectors: `NOTION_ACTIVE_USER_ID_2` through
+`NOTION_ACTIVE_USER_ID_16`, `NOTION_SPACE_ID_2` through `NOTION_SPACE_ID_16`,
+and `NOTION_EXPECTED_EMAIL_2` through `NOTION_EXPECTED_EMAIL_16`. Startup first
+discovers every configured account, deduplicates by `account_id`, and then
+persists the accounts one by one. It activates the pool only after every save
+succeeds.
+
 ## Quick Start
 
 > **Prerequisites:** Go 1.25+, at least one Notion account. No Chrome extension needed if you only plan to add accounts via the dashboard.

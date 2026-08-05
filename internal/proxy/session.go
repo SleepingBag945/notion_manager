@@ -23,6 +23,9 @@ type Session struct {
 	ConfigID  string
 	ContextID string
 
+	// ContextPageID is generated independently from the transcript IDs and reused across turns.
+	ContextPageID string
+
 	// Each completed turn produces one updated-config placeholder ID
 	UpdatedConfigIDs []string
 
@@ -225,6 +228,17 @@ func computeSessionFingerprintWithSalt(messages []ChatMessage, stableSalt string
 	return hex.EncodeToString(h.Sum(nil))[:32]
 }
 
+func computeSessionFingerprintForRequest(messages []ChatMessage, sessionSalt string, resolvedModel string) string {
+	sessionSalt = strings.TrimSpace(sessionSalt)
+	resolvedModel = strings.TrimSpace(resolvedModel)
+	modelSalt := fmt.Sprintf("model:%d:%s", len(resolvedModel), resolvedModel)
+	if sessionSalt == "" {
+		return computeSessionFingerprintWithSalt(messages, modelSalt)
+	}
+	stableSalt := fmt.Sprintf("session:%d:%s\n%s", len(sessionSalt), sessionSalt, modelSalt)
+	return computeSessionFingerprintWithSalt(nil, stableSalt)
+}
+
 // computeSessionFingerprint keeps the legacy signature for tests/callers that
 // do not have an explicit stable salt available.
 func computeSessionFingerprint(messages []ChatMessage) string {
@@ -270,22 +284,17 @@ func extractLastUserMessage(messages []ChatMessage) string {
 // Notion thread. Replaying assistant history as a fresh transcript is brittle
 // and can lead to empty responses from Notion.
 func needsFreshThreadRecovery(messages []ChatMessage) bool {
-	lastUserIdx := -1
-	for i := len(messages) - 1; i >= 0; i-- {
-		if isMeaningfulUserMessage(messages[i]) {
-			lastUserIdx = i
-			break
+	hasMeaningfulUser := false
+	hasAssistantOrToolHistory := false
+	for _, message := range messages {
+		if isMeaningfulUserMessage(message) {
+			hasMeaningfulUser = true
+		}
+		if (message.Role == "assistant" || message.Role == "tool") && shouldCountNonSystemMessage(message) {
+			hasAssistantOrToolHistory = true
 		}
 	}
-	if lastUserIdx <= 0 {
-		return false
-	}
-	for i := 0; i < lastUserIdx; i++ {
-		if shouldCountNonSystemMessage(messages[i]) {
-			return true
-		}
-	}
-	return false
+	return hasMeaningfulUser && hasAssistantOrToolHistory
 }
 
 // buildFreshThreadRecoveryMessages collapses prior conversation state into a
@@ -297,7 +306,6 @@ func buildRecoveryMessages(messages []ChatMessage, skipEntry func(ChatMessage, s
 	}
 
 	const (
-		maxSystemChars  = 1200
 		maxHistoryChars = 4000
 		maxEntryChars   = 900
 	)
@@ -334,7 +342,17 @@ func buildRecoveryMessages(messages []ChatMessage, skipEntry func(ChatMessage, s
 
 	var reversed []historyEntry
 	usedChars := 0
-	for i := lastUserIdx - 1; i >= 0; i-- {
+	hasPostUserHistory := false
+	for i := lastUserIdx + 1; i < len(messages); i++ {
+		if (messages[i].Role == "assistant" || messages[i].Role == "tool") && shouldCountNonSystemMessage(messages[i]) {
+			hasPostUserHistory = true
+			break
+		}
+	}
+	for i := len(messages) - 1; i >= 0; i-- {
+		if i == lastUserIdx && !hasPostUserHistory {
+			continue
+		}
 		m := messages[i]
 		if m.Role == "system" {
 			continue
@@ -343,9 +361,6 @@ func buildRecoveryMessages(messages []ChatMessage, skipEntry func(ChatMessage, s
 		content := strings.TrimSpace(m.Content)
 		if m.Role == "user" {
 			content = normalizeSessionUserContent(m.Content)
-		}
-		if content == "" {
-			continue
 		}
 		if skipEntry != nil && skipEntry(m, content) {
 			continue
@@ -357,13 +372,33 @@ func buildRecoveryMessages(messages []ChatMessage, skipEntry func(ChatMessage, s
 			label = "User"
 		case "assistant":
 			label = "Assistant"
+			for _, toolCall := range m.ToolCalls {
+				name := strings.TrimSpace(toolCall.Function.Name)
+				if name == "" {
+					name = "tool"
+				}
+				toolCallText := "Tool call " + name
+				if args := strings.TrimSpace(toolCall.Function.Arguments); args != "" {
+					toolCallText += ": " + args
+				}
+				if content != "" {
+					content += "\n"
+				}
+				content += toolCallText
+			}
 		case "tool":
 			name := m.Name
 			if name == "" {
 				name = "tool"
 			}
 			label = fmt.Sprintf("Tool (%s)", name)
+			if content == "" && m.ToolCallID != "" {
+				content = "Tool result for " + m.ToolCallID
+			}
 		default:
+			continue
+		}
+		if content == "" {
 			continue
 		}
 
@@ -395,7 +430,7 @@ func buildRecoveryMessages(messages []ChatMessage, skipEntry func(ChatMessage, s
 
 	if len(systemParts) > 0 {
 		prompt.WriteString("\n\nSystem instructions:\n")
-		prompt.WriteString(clip(strings.Join(systemParts, "\n\n"), maxSystemChars))
+		prompt.WriteString(strings.Join(systemParts, "\n\n"))
 	}
 
 	if history.Len() > 0 {

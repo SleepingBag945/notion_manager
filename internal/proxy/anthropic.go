@@ -195,7 +195,7 @@ func renderAnthropicCitationText(rawText string, knownURLs []string, knownDocs [
 // It replaces inline citations [^{{URL}}] with [N] in real-time using
 // a buffered state machine, emits thinking blocks as they arrive,
 // then appends a Sources section.
-func streamWebSearch(w http.ResponseWriter, flusher http.Flusher, acc *Account, query string, model string, requestID string, blockIndex *int, hasThinking bool) (*UsageInfo, error) {
+func streamWebSearch(w http.ResponseWriter, flusher http.Flusher, acc *Account, query string, model string, requestID string, blockIndex *int, hasThinking bool, reasoningEffort string) (*UsageInfo, error) {
 	var finalUsage *UsageInfo
 	var thinkingBlocks []ThinkingBlock
 	var streamedText strings.Builder
@@ -209,14 +209,11 @@ func streamWebSearch(w http.ResponseWriter, flusher http.Flusher, acc *Account, 
 	messages := []ChatMessage{
 		{Role: "user", Content: query},
 	}
-	callOpts := CallOptions{
-		EnableWebSearch:   true,
-		ThinkingBlocks:    &thinkingBlocks,
-		KnownCitationURLs: &knownCitationURLs,
-		KnownCitationDocs: &knownCitationDocs,
-		KnownToolCallURLs: &knownToolCallURLs,
-		RequestID:         requestID,
-	}
+	callOpts := buildWebSearchCallOptions(requestID, reasoningEffort)
+	callOpts.ThinkingBlocks = &thinkingBlocks
+	callOpts.KnownCitationURLs = &knownCitationURLs
+	callOpts.KnownCitationDocs = &knownCitationDocs
+	callOpts.KnownToolCallURLs = &knownToolCallURLs
 
 	// emitPendingThinking emits any thinking blocks that have been collected
 	// since the last check. Called before first text delta to ensure thinking
@@ -438,6 +435,13 @@ func isJSONSchemaOutput(outputConfig *AnthropicOutputConfig) bool {
 	return outputConfig != nil && outputConfig.Format != nil && outputConfig.Format.Type == "json_schema" && outputConfig.Format.Schema != nil
 }
 
+func outputConfigReasoningEffort(outputConfig *AnthropicOutputConfig) string {
+	if outputConfig == nil {
+		return ""
+	}
+	return outputConfig.Effort
+}
+
 func extractStructuredJSONObject(content string) string {
 	trimmed := strings.TrimSpace(content)
 	if trimmed == "" {
@@ -619,20 +623,21 @@ func extractAnthropicSessionSalt(metadata map[string]interface{}) string {
 			}
 			var parsed map[string]interface{}
 			if json.Unmarshal([]byte(trimmed), &parsed) == nil {
-				if sid, ok := parsed["session_id"].(string); ok && sid != "" {
-					return sid
+				if sid, ok := parsed["session_id"].(string); ok && strings.TrimSpace(sid) != "" {
+					return strings.TrimSpace(sid)
 				}
+				return ""
 			}
-			return ""
+			return trimmed
 		case map[string]interface{}:
-			if sid, ok := tv["session_id"].(string); ok && sid != "" {
-				return sid
+			if sid, ok := tv["session_id"].(string); ok && strings.TrimSpace(sid) != "" {
+				return strings.TrimSpace(sid)
 			}
 		}
 		return ""
 	}
 
-	for _, key := range []string{"session_id", "conversation_id", "user_id"} {
+	for _, key := range []string{"prompt_cache_key", "session_id", "conversation_id", "user_id"} {
 		if sid := extractFromValue(metadata[key]); sid != "" {
 			return sid
 		}
@@ -726,6 +731,15 @@ func applyStructuredOutputBridge(messages []ChatMessage, outputConfig *Anthropic
 
 // ========== Handler ==========
 
+func handlePremiumFeatureUnavailable(pool *AccountPool, acc *Account) {
+	if isFreePlan(acc) {
+		log.Printf("[premium] %s (free plan) premium feature unavailable — disabling permanently", acc.UserEmail)
+		pool.MarkInferenceUnavailable(acc)
+		return
+	}
+	log.Printf("[premium] %s premium feature unavailable, trying next account", acc.UserEmail)
+}
+
 // HandleAnthropicMessages returns an HTTP handler for the /v1/messages endpoint (Anthropic Messages API)
 func HandleAnthropicMessages(pool *AccountPool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -761,6 +775,14 @@ func HandleAnthropicMessages(pool *AccountPool) http.HandlerFunc {
 			writeAnthropicError(w, requestID, http.StatusBadRequest, "messages is required", "invalid_request_error")
 			return
 		}
+		if req.OutputConfig != nil {
+			reasoningEffort, err := normalizeReasoningEffort(req.OutputConfig.Effort)
+			if err != nil {
+				writeAnthropicError(w, requestID, http.StatusBadRequest, err.Error(), "invalid_request_error")
+				return
+			}
+			req.OutputConfig.Effort = reasoningEffort
+		}
 
 		model := req.Model
 		if model == "" {
@@ -779,6 +801,7 @@ func HandleAnthropicMessages(pool *AccountPool) http.HandlerFunc {
 			log.Printf("[ask-mode] %q -> %q (per-request override)", model, stripped)
 		}
 		model = stripped
+		resolvedModel := ResolveModel(model)
 		useReadOnlyMode := askFromModel || AppConfig.AskModeDefault()
 
 		// ── Detailed request logging ──
@@ -838,7 +861,7 @@ func HandleAnthropicMessages(pool *AccountPool) http.HandlerFunc {
 		rawMsgCount := 0
 
 		if !isResearcher {
-			fingerprint = computeSessionFingerprintWithSalt(messages, sessionSalt)
+			fingerprint = computeSessionFingerprintForRequest(messages, sessionSalt, resolvedModel)
 			session = globalSessionManager.Get(fingerprint)
 			rawMsgCount = countNonSystemMessages(messages)
 
@@ -933,10 +956,8 @@ func HandleAnthropicMessages(pool *AccountPool) http.HandlerFunc {
 					}
 					log.Printf("[session] bound account %s %s, will pick a new account and replay history",
 						session.AccountEmail, reason)
-					if bound != nil && isFreePlan(bound) {
-						pool.RemoveAccount(bound)
-					} else if bound != nil {
-						pool.MarkQuotaExhausted(bound)
+					if bound != nil {
+						pool.MarkInferenceUnavailable(bound)
 					}
 					globalSessionManager.Delete(fingerprint)
 					session = nil
@@ -974,11 +995,7 @@ func HandleAnthropicMessages(pool *AccountPool) http.HandlerFunc {
 			if !isResearcher && !pool.RefreshAccountQuota(acc, liveCheckInterval) {
 				log.Printf("[quota-live] %s skipped (exhausted on live check)", acc.UserEmail)
 				tried[acc] = true
-				if isFreePlan(acc) {
-					pool.RemoveAccount(acc)
-				} else {
-					pool.MarkQuotaExhausted(acc)
-				}
+				pool.MarkInferenceUnavailable(acc)
 				continue
 			}
 			tried[acc] = true
@@ -1042,10 +1059,12 @@ func HandleAnthropicMessages(pool *AccountPool) http.HandlerFunc {
 			// Upload file attachments to Notion (if any) — skip for researcher mode
 			var uploadedAttachments []UploadedAttachment
 			if !isResearcher && len(fileAttachments) > 0 {
+				uploadPlan := buildAttachmentUploadPlan(currentSession.ThreadID, len(fileAttachments), isFirstTurn)
 				for i, fa := range fileAttachments {
+					target := uploadPlan[i]
 					log.Printf("[upload-debug] %s: uploading attachment %d/%d: %s (%s, %d bytes)",
 						requestID, i+1, len(fileAttachments), fa.FileName, fa.ContentType, len(fa.Data))
-					uploaded, err := UploadFileToNotion(acc, &fa)
+					uploaded, err := UploadFileToNotionThread(acc, &fa, target.ThreadID, target.CreateThread)
 					if err != nil {
 						log.Printf("[upload] %s: attachment %d upload failed: %v", requestID, i+1, err)
 						writeAnthropicError(w, requestID, http.StatusBadGateway, "file upload failed: "+err.Error(), "api_error")
@@ -1093,11 +1112,11 @@ func HandleAnthropicMessages(pool *AccountPool) http.HandlerFunc {
 			}
 			if reqErr != nil && errors.Is(reqErr, ErrQuotaExhausted) {
 				if isFreePlan(acc) {
-					log.Printf("[quota] %s (free plan) quota exhausted — removing account", acc.UserEmail)
-					pool.RemoveAccount(acc)
+					log.Printf("[quota] %s (free plan) quota exhausted — disabling permanently", acc.UserEmail)
 				} else {
-					pool.MarkQuotaExhausted(acc)
+					log.Printf("[quota] %s quota exhausted — disabling until API-confirmed recovery", acc.UserEmail)
 				}
+				pool.MarkInferenceUnavailable(acc)
 				log.Printf("[quota] %s quota exhausted, trying next account (%d/%d available)",
 					acc.UserEmail, pool.AvailableCount(), pool.Count())
 				// Clear session if the bound account was exhausted
@@ -1143,12 +1162,7 @@ func HandleAnthropicMessages(pool *AccountPool) http.HandlerFunc {
 
 			if reqErr != nil && errors.Is(reqErr, ErrPremiumFeatureUnavailable) {
 				// Premium feature unavailable — for free accounts this means quota is permanently gone
-				if isFreePlan(acc) {
-					log.Printf("[premium] %s (free plan) premium feature unavailable — removing account", acc.UserEmail)
-					pool.RemoveAccount(acc)
-				} else {
-					log.Printf("[premium] %s premium feature unavailable, trying next account", acc.UserEmail)
-				}
+				handlePremiumFeatureUnavailable(pool, acc)
 				if !isFirstTurn && session != nil {
 					globalSessionManager.Delete(fingerprint)
 					session = nil
@@ -1177,7 +1191,7 @@ func HandleAnthropicMessages(pool *AccountPool) http.HandlerFunc {
 					currentSession.TurnCount = 1
 					currentSession.RawMessageCount = rawMsgCount
 					currentSession.UpdatedConfigIDs = []string{generateUUIDv4()}
-					currentSession.ModelUsed = ResolveModel(model)
+					currentSession.ModelUsed = resolvedModel
 					globalSessionManager.Set(fingerprint, currentSession)
 					log.Printf("[session] saved new session: thread=%s fingerprint=%s rawMsgs=%d",
 						currentSession.ThreadID, fingerprint[:8], rawMsgCount)
@@ -1704,6 +1718,7 @@ func handleAnthropicStream(w http.ResponseWriter, acc *Account, messages []ChatM
 		EnableWebSearch:       enableWebSearch,
 		EnableWorkspaceSearch: enableWorkspaceSearch,
 		UseReadOnlyMode:       useReadOnlyMode,
+		ReasoningEffort:       outputConfigReasoningEffort(outputConfig),
 		Attachments:           attachments,
 		KnownCitationURLs:     &knownCitationURLs,
 		KnownCitationDocs:     &knownCitationDocs,
@@ -1888,7 +1903,7 @@ func handleAnthropicStream(w http.ResponseWriter, acc *Account, messages []ChatM
 		// Stream WebSearch results in real-time (after text blocks, before tool_use)
 		if webSearchQuery != "" {
 			log.Printf("[bridge] WebSearch intercepted — streaming via Notion native search: %q", webSearchQuery)
-			searchUsage, searchErr := streamWebSearch(w, flusher, acc, webSearchQuery, model, requestID, &blockIndex, hasThinking)
+			searchUsage, searchErr := streamWebSearch(w, flusher, acc, webSearchQuery, model, requestID, &blockIndex, hasThinking, outputConfigReasoningEffort(outputConfig))
 			if searchErr != nil {
 				log.Printf("[bridge] WebSearch streaming failed: %v", searchErr)
 			}
@@ -1982,6 +1997,7 @@ func handleAnthropicNonStream(w http.ResponseWriter, acc *Account, messages []Ch
 		EnableWebSearch:       enableWebSearch,
 		EnableWorkspaceSearch: enableWorkspaceSearch,
 		UseReadOnlyMode:       useReadOnlyMode,
+		ReasoningEffort:       outputConfigReasoningEffort(outputConfig),
 		Attachments:           attachments,
 		KnownCitationURLs:     &knownCitationURLs,
 		KnownCitationDocs:     &knownCitationDocs,
@@ -2093,7 +2109,7 @@ func handleAnthropicNonStream(w http.ResponseWriter, acc *Account, messages []Ch
 		// Intercept WebSearch tool calls → execute via Notion's native search
 		if prepared.WebSearchQuery != "" {
 			log.Printf("[bridge] WebSearch intercepted — executing via Notion native search: %q", prepared.WebSearchQuery)
-			searchResult, searchUsage, searchErr := executeWebSearch(acc, prepared.WebSearchQuery, model, requestID)
+			searchResult, searchUsage, searchErr := executeWebSearch(acc, prepared.WebSearchQuery, model, requestID, outputConfigReasoningEffort(outputConfig))
 			if searchErr == nil && searchResult != "" {
 				if doneText != "" {
 					doneText = doneText + "\n\n" + searchResult

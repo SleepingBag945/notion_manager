@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	mrand "math/rand"
 	"os"
@@ -21,10 +22,82 @@ import (
 // transport pinned to www.notion.so, which can't be repointed at httptest
 // URLs).
 var (
-	quotaFetcher   = CheckQuota
-	modelsFetcher  = FetchModels
-	workspaceProbe = CheckUserWorkspace
+	quotaFetcher    = CheckQuota
+	modelsFetcher   = FetchModels
+	workspaceProbe  = CheckUserWorkspace
+	accountChmod    = os.Chmod
+	accountReadFile = os.ReadFile
 )
+
+const (
+	accountsDirMode = 0o700
+	accountFileMode = 0o600
+)
+
+func ensurePrivateAccountsDir(dir string) error {
+	if err := os.MkdirAll(dir, accountsDirMode); err != nil {
+		return err
+	}
+	return accountChmod(dir, accountsDirMode)
+}
+
+func chmodAccountDir(dir string) error {
+	return accountChmod(dir, accountsDirMode)
+}
+
+func chmodAccountFile(path string) error {
+	return accountChmod(path, accountFileMode)
+}
+
+func readPrivateAccountsDir(dir string) ([]os.DirEntry, error) {
+	if err := chmodAccountDir(dir); err != nil {
+		return nil, fmt.Errorf("secure accounts dir permissions: %w", err)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, fmt.Errorf("read accounts dir: %w", err)
+	}
+	return entries, nil
+}
+
+func readPrivateAccountFile(path string) ([]byte, error) {
+	if err := chmodAccountFile(path); err != nil {
+		return nil, fmt.Errorf("secure account file %s permissions: %w", filepath.Base(path), err)
+	}
+	data, err := accountReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read account file %s: %w", filepath.Base(path), err)
+	}
+	return data, nil
+}
+
+func writePrivateAccountFile(path string, data []byte) (err error) {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE, accountFileMode)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if closeErr := f.Close(); err == nil {
+			err = closeErr
+		}
+	}()
+
+	if err := f.Chmod(accountFileMode); err != nil {
+		return err
+	}
+	if err := f.Truncate(0); err != nil {
+		return err
+	}
+	if _, err := f.Seek(0, 0); err != nil {
+		return err
+	}
+	if n, err := f.Write(data); err != nil {
+		return err
+	} else if n != len(data) {
+		return io.ErrShortWrite
+	}
+	return nil
+}
 
 type AccountPool struct {
 	mu       sync.RWMutex
@@ -49,6 +122,16 @@ func NewAccountPool() *AccountPool {
 	return &AccountPool{
 		liveQuotaInflight: make(map[*Account]bool),
 	}
+}
+
+// AccountsSnapshot returns a stable copy of the pool membership for startup
+// activation. Mutating the returned slice does not change the source pool.
+func (p *AccountPool) AccountsSnapshot() []*Account {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	accounts := make([]*Account, len(p.accounts))
+	copy(accounts, p.accounts)
+	return accounts
 }
 
 type accountQuotaSnapshot struct {
@@ -158,9 +241,17 @@ func (acc *Account) clearQuotaExhausted() {
 }
 
 func (p *AccountPool) LoadFromDir(dir string) error {
-	entries, err := os.ReadDir(dir)
+	entries, err := readPrivateAccountsDir(dir)
 	if err != nil {
-		return fmt.Errorf("read accounts dir: %w", err)
+		return err
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
+			continue
+		}
+		if err := chmodAccountFile(filepath.Join(dir, entry.Name())); err != nil {
+			return fmt.Errorf("secure account file %s permissions: %w", entry.Name(), err)
+		}
 	}
 
 	seen := make(map[string]bool)
@@ -169,10 +260,9 @@ func (p *AccountPool) LoadFromDir(dir string) error {
 			continue
 		}
 		path := filepath.Join(dir, entry.Name())
-		data, err := os.ReadFile(path)
+		data, err := readPrivateAccountFile(path)
 		if err != nil {
-			log.Printf("[account] skip %s: %v", entry.Name(), err)
-			continue
+			return err
 		}
 		var acc Account
 		if err := json.Unmarshal(data, &acc); err != nil {
@@ -236,7 +326,7 @@ func (p *AccountPool) ReloadFromDir(dir string) {
 		}
 	}
 
-	entries, err := os.ReadDir(dir)
+	entries, err := readPrivateAccountsDir(dir)
 	if err != nil {
 		log.Printf("[account] reload %s: %v", dir, err)
 		return
@@ -247,8 +337,9 @@ func (p *AccountPool) ReloadFromDir(dir string) {
 			continue
 		}
 		path := filepath.Join(dir, entry.Name())
-		data, err := os.ReadFile(path)
+		data, err := readPrivateAccountFile(path)
 		if err != nil {
+			log.Printf("[account] reload skip %s: %v", entry.Name(), err)
 			continue
 		}
 		var acc Account
@@ -283,9 +374,9 @@ func (p *AccountPool) ReloadFromDir(dir string) {
 }
 
 func (p *AccountPool) LoadSingle(tokenFile string) error {
-	data, err := os.ReadFile(tokenFile)
+	data, err := readPrivateAccountFile(tokenFile)
 	if err != nil {
-		return err
+		return fmt.Errorf("secure token file: %w", err)
 	}
 
 	var acc Account
@@ -479,13 +570,13 @@ func (p *AccountPool) isQuotaExhausted(acc *Account) bool {
 	if quota.PermanentlyExhausted {
 		return true
 	}
+	if quota.ExhaustedAt != nil {
+		return true
+	}
 	if quota.Info != nil {
 		return !quota.Info.IsEligible
 	}
-	if quota.ExhaustedAt == nil {
-		return false
-	}
-	return true
+	return false
 }
 
 // hasNoWorkspace returns true only after a probe has confirmed the
@@ -524,6 +615,21 @@ func (p *AccountPool) MarkPermanentlyExhausted(acc *Account) {
 	log.Printf("[quota] marked %s (%s) as PERMANENTLY exhausted (free plan, no recovery)", acc.UserName, acc.UserEmail)
 }
 
+// MarkInferenceUnavailable keeps an automatically-disabled account in the
+// pool and on disk while preventing future inference routing. Free accounts
+// are permanent because their lifetime credits do not reset; paid accounts
+// remain eligible for a later API-confirmed recovery.
+func (p *AccountPool) MarkInferenceUnavailable(acc *Account) {
+	if acc == nil {
+		return
+	}
+	if isFreePlan(acc) {
+		p.MarkPermanentlyExhausted(acc)
+		return
+	}
+	p.MarkQuotaExhausted(acc)
+}
+
 // quotaApplyResult describes how applyQuotaInfo changed the account state.
 // Caller can use it to emit a human-friendly log line.
 type quotaApplyResult struct {
@@ -552,6 +658,9 @@ func (p *AccountPool) applyQuotaInfo(acc *Account, info *QuotaInfo) quotaApplyRe
 	res.BasicLeft = basicRemaining(info)
 	res.HasPremium = info.HasPremium
 	if info.IsEligible {
+		if acc.PermanentlyExhausted {
+			return res
+		}
 		if acc.QuotaExhaustedAt != nil {
 			res.Recovered = true
 		}
@@ -707,8 +816,9 @@ func (p *AccountPool) RemoveAccount(acc *Account) {
 	if dir == "" {
 		return
 	}
-	entries, err := os.ReadDir(dir)
+	entries, err := readPrivateAccountsDir(dir)
 	if err != nil {
+		log.Printf("[account] remove %s: %v", acc.UserEmail, err)
 		return
 	}
 	for _, entry := range entries {
@@ -716,9 +826,10 @@ func (p *AccountPool) RemoveAccount(acc *Account) {
 			continue
 		}
 		path := filepath.Join(dir, entry.Name())
-		data, err := os.ReadFile(path)
+		data, err := readPrivateAccountFile(path)
 		if err != nil {
-			continue
+			log.Printf("[account] remove %s: %v", acc.UserEmail, err)
+			return
 		}
 		var existing map[string]interface{}
 		if err := json.Unmarshal(data, &existing); err != nil {
@@ -1118,9 +1229,12 @@ func saveAccountFile(dir string, acc *Account) error {
 	if dir == "" {
 		return fmt.Errorf("saveAccountFile: empty dir")
 	}
-	entries, err := os.ReadDir(dir)
+	if err := ensurePrivateAccountsDir(dir); err != nil {
+		return fmt.Errorf("secure accounts dir: %w", err)
+	}
+	entries, err := readPrivateAccountsDir(dir)
 	if err != nil {
-		return fmt.Errorf("read dir: %w", err)
+		return err
 	}
 	var matchPath string
 	var existing map[string]interface{}
@@ -1129,9 +1243,9 @@ func saveAccountFile(dir string, acc *Account) error {
 			continue
 		}
 		path := filepath.Join(dir, entry.Name())
-		data, err := os.ReadFile(path)
+		data, err := readPrivateAccountFile(path)
 		if err != nil {
-			continue
+			return err
 		}
 		var raw map[string]interface{}
 		if err := json.Unmarshal(data, &raw); err != nil {
@@ -1199,7 +1313,7 @@ func saveAccountFile(dir string, acc *Account) error {
 	}
 	out = append(out, '\n')
 	tmp := matchPath + ".tmp"
-	if err := os.WriteFile(tmp, out, 0o644); err != nil {
+	if err := writePrivateAccountFile(tmp, out); err != nil {
 		return fmt.Errorf("write tmp: %w", err)
 	}
 	if err := os.Rename(tmp, matchPath); err != nil {

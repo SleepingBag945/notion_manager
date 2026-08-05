@@ -49,7 +49,27 @@ func NewAccountDTO(acc *Account) AccountDTO {
 // DiscoverAccountFromToken calls Notion APIs using the given token_v2 to discover
 // all account information (user, space, models, quota).
 func DiscoverAccountFromToken(tokenV2 string) (*Account, error) {
-	client := getChromeHTTPClient(AppConfig.APITimeoutDuration())
+	return DiscoverAccountFromTokenWithOptions(tokenV2, AccountDiscoveryOptions{})
+}
+
+// AccountDiscoveryOptions pins a multi-account Notion session to the intended
+// active user and workspace. Empty fields retain the legacy automatic choice.
+type AccountDiscoveryOptions struct {
+	ActiveUserID  string
+	SpaceID       string
+	ExpectedEmail string
+}
+
+var (
+	discoveryHTTPClient  = getChromeHTTPClient
+	discoveryFetchModels = FetchModels
+	discoveryCheckQuota  = CheckQuota
+)
+
+// DiscoverAccountFromTokenWithOptions discovers an account while applying
+// optional exact selectors for multi-account browser sessions.
+func DiscoverAccountFromTokenWithOptions(tokenV2 string, options AccountDiscoveryOptions) (*Account, error) {
+	client := discoveryHTTPClient(AppConfig.APITimeoutDuration())
 
 	// Step 1: Call loadUserContent to get user/space info
 	req, err := http.NewRequest("POST", NotionAPIBase+"/loadUserContent", bytes.NewReader([]byte("{}")))
@@ -58,8 +78,14 @@ func DiscoverAccountFromToken(tokenV2 string) (*Account, error) {
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("Cookie", "token_v2="+tokenV2)
 	req.Header.Set("User-Agent", AppConfig.Browser.UserAgent)
+	activeUserID := strings.TrimSpace(options.ActiveUserID)
+	cookieHeader := "token_v2=" + tokenV2
+	if activeUserID != "" {
+		cookieHeader = accountCookieHeader(&Account{TokenV2: tokenV2, UserID: activeUserID})
+		req.Header.Set("x-notion-active-user-header", activeUserID)
+	}
+	req.Header.Set("Cookie", cookieHeader)
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -84,10 +110,41 @@ func DiscoverAccountFromToken(tokenV2 string) (*Account, error) {
 		return nil, fmt.Errorf("parse loadUserContent: %w", err)
 	}
 
+	type spaceViewPointer struct {
+		SpaceID string `json:"spaceId"`
+		ID      string `json:"id"`
+	}
+	spaceViewPointersForUser := func(userID string) []spaceViewPointer {
+		var pointers []spaceViewPointer
+		raw, ok := userData.RecordMap.UserRoot[userID]
+		if !ok {
+			return pointers
+		}
+		var ur struct {
+			Value struct {
+				Value *struct {
+					SpaceViewPointers []spaceViewPointer `json:"space_view_pointers"`
+				} `json:"value"`
+				SpaceViewPointers []spaceViewPointer `json:"space_view_pointers"`
+			} `json:"value"`
+		}
+		if err := json.Unmarshal(raw, &ur); err != nil {
+			return pointers
+		}
+		if ur.Value.Value != nil {
+			return ur.Value.Value.SpaceViewPointers
+		}
+		return ur.Value.SpaceViewPointers
+	}
+
 	// Extract user ID and info
+	expectedEmail := strings.TrimSpace(options.ExpectedEmail)
+	requestedSpaceID := strings.TrimSpace(options.SpaceID)
 	var userID, userName, userEmail string
 	for id, raw := range userData.RecordMap.NotionUser {
-		userID = id
+		if activeUserID != "" && id != activeUserID {
+			continue
+		}
 		var u struct {
 			Value struct {
 				Value *struct {
@@ -98,44 +155,44 @@ func DiscoverAccountFromToken(tokenV2 string) (*Account, error) {
 				Email string `json:"email"`
 			} `json:"value"`
 		}
-		if err := json.Unmarshal(raw, &u); err == nil {
-			if u.Value.Value != nil {
-				userName = u.Value.Value.Name
-				userEmail = u.Value.Value.Email
-			} else {
-				userName = u.Value.Name
-				userEmail = u.Value.Email
+		if err := json.Unmarshal(raw, &u); err != nil {
+			continue
+		}
+		candidateName := u.Value.Name
+		candidateEmail := u.Value.Email
+		if u.Value.Value != nil {
+			candidateName = u.Value.Value.Name
+			candidateEmail = u.Value.Value.Email
+		}
+		if expectedEmail != "" && !strings.EqualFold(candidateEmail, expectedEmail) {
+			continue
+		}
+		if requestedSpaceID != "" {
+			matchedSpace := false
+			for _, ptr := range spaceViewPointersForUser(id) {
+				if ptr.SpaceID == requestedSpaceID {
+					matchedSpace = true
+					break
+				}
+			}
+			if !matchedSpace {
+				continue
 			}
 		}
+		userID = id
+		userName = candidateName
+		userEmail = candidateEmail
 		break
 	}
 	if userID == "" {
+		if activeUserID != "" || expectedEmail != "" || requestedSpaceID != "" {
+			return nil, fmt.Errorf("no user matched the configured Notion account selectors")
+		}
 		return nil, fmt.Errorf("no user found in loadUserContent response")
 	}
 
 	// Extract space view pointers from user_root
-	type spaceViewPointer struct {
-		SpaceID string `json:"spaceId"`
-		ID      string `json:"id"`
-	}
-	var spaceViewPointers []spaceViewPointer
-	if raw, ok := userData.RecordMap.UserRoot[userID]; ok {
-		var ur struct {
-			Value struct {
-				Value *struct {
-					SpaceViewPointers []spaceViewPointer `json:"space_view_pointers"`
-				} `json:"value"`
-				SpaceViewPointers []spaceViewPointer `json:"space_view_pointers"`
-			} `json:"value"`
-		}
-		if err := json.Unmarshal(raw, &ur); err == nil {
-			if ur.Value.Value != nil {
-				spaceViewPointers = ur.Value.Value.SpaceViewPointers
-			} else {
-				spaceViewPointers = ur.Value.SpaceViewPointers
-			}
-		}
-	}
+	spaceViewPointers := spaceViewPointersForUser(userID)
 
 	// Find the best space (AI enabled, non-free preferred)
 	type spaceInfo struct {
@@ -147,6 +204,9 @@ func DiscoverAccountFromToken(tokenV2 string) (*Account, error) {
 	}
 	var bestSpace *spaceInfo
 	for _, ptr := range spaceViewPointers {
+		if requestedSpaceID != "" && ptr.SpaceID != requestedSpaceID {
+			continue
+		}
 		raw, ok := userData.RecordMap.Space[ptr.SpaceID]
 		if !ok {
 			continue
@@ -192,11 +252,20 @@ func DiscoverAccountFromToken(tokenV2 string) (*Account, error) {
 		if si.ID == "" {
 			si.ID = ptr.SpaceID
 		}
+		if requestedSpaceID != "" {
+			if si.ID == requestedSpaceID {
+				bestSpace = &si
+			}
+			break
+		}
 		if bestSpace == nil || (si.AIEnabled && si.PlanType != "free") {
 			bestSpace = &si
 		}
 	}
 	if bestSpace == nil {
+		if requestedSpaceID != "" {
+			return nil, fmt.Errorf("requested NOTION_SPACE_ID was not found for the active account")
+		}
 		return nil, fmt.Errorf("no workspace found for this account")
 	}
 
@@ -245,7 +314,7 @@ func DiscoverAccountFromToken(tokenV2 string) (*Account, error) {
 	acc.EnsureAccountID()
 
 	// Step 2: Fetch available models
-	models, err := FetchModels(acc)
+	models, err := discoveryFetchModels(acc)
 	if err != nil {
 		log.Printf("[add-account] model fetch failed (non-fatal): %v", err)
 	} else {
@@ -253,7 +322,7 @@ func DiscoverAccountFromToken(tokenV2 string) (*Account, error) {
 	}
 
 	// Step 3: Check quota
-	quota, err := CheckQuota(acc)
+	quota, err := discoveryCheckQuota(acc)
 	if err != nil {
 		log.Printf("[add-account] quota check failed (non-fatal): %v", err)
 	} else {
@@ -275,19 +344,19 @@ func DiscoverAccountFromToken(tokenV2 string) (*Account, error) {
 // findFileByAccountIDOnDisk scans dir for a JSON file whose "account_id" field
 // (or computed account_id from user_id+space_id) matches the given accountID.
 // Returns the full path if found, or "" if no match exists.
-func findFileByAccountIDOnDisk(dir, accountID string) string {
-	entries, err := os.ReadDir(dir)
+func findFileByAccountIDOnDisk(dir, accountID string) (string, error) {
+	entries, err := readPrivateAccountsDir(dir)
 	if err != nil {
-		return ""
+		return "", err
 	}
 	for _, entry := range entries {
 		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
 			continue
 		}
 		path := filepath.Join(dir, entry.Name())
-		data, err := os.ReadFile(path)
+		data, err := readPrivateAccountFile(path)
 		if err != nil {
-			continue
+			return "", err
 		}
 		var m map[string]interface{}
 		if err := json.Unmarshal(data, &m); err != nil {
@@ -302,14 +371,17 @@ func findFileByAccountIDOnDisk(dir, accountID string) string {
 			}
 		}
 		if aid == accountID {
-			return path
+			return path, nil
 		}
 	}
-	return ""
+	return "", nil
 }
 
 func SaveAccountToFile(acc *Account, dir string) (string, error) {
 	acc.EnsureAccountID()
+	if err := ensurePrivateAccountsDir(dir); err != nil {
+		return "", fmt.Errorf("create accounts dir: %w", err)
+	}
 
 	name := acc.UserEmail
 	if name == "" {
@@ -332,7 +404,10 @@ func SaveAccountToFile(acc *Account, dir string) (string, error) {
 	// naming scheme like "<aid[:12]>_email.json"). If found, reuse that path
 	// to avoid duplicates; otherwise use the new canonical name.
 	filename := newFilename
-	existingPath := findFileByAccountIDOnDisk(dir, acc.AccountID)
+	existingPath, err := findFileByAccountIDOnDisk(dir, acc.AccountID)
+	if err != nil {
+		return "", fmt.Errorf("find existing account file: %w", err)
+	}
 	if existingPath != "" {
 		filename = filepath.Base(existingPath)
 	}
@@ -390,11 +465,11 @@ func SaveAccountToFile(acc *Account, dir string) (string, error) {
 	}
 
 	// Ensure accounts directory exists
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	if err := ensurePrivateAccountsDir(dir); err != nil {
 		return "", fmt.Errorf("create accounts dir: %w", err)
 	}
 
-	if err := os.WriteFile(path, append(out, '\n'), 0644); err != nil {
+	if err := writePrivateAccountFile(path, append(out, '\n')); err != nil {
 		return "", fmt.Errorf("write account file: %w", err)
 	}
 
@@ -423,18 +498,18 @@ func (p *AccountPool) AddAccount(acc *Account) {
 // DeleteAccountFile removes the JSON file for an account from the accounts directory.
 // Matches by account_id first; falls back to user_id+space_id.
 func DeleteAccountFile(accountID, dir string) error {
-	entries, err := os.ReadDir(dir)
+	entries, err := readPrivateAccountsDir(dir)
 	if err != nil {
-		return fmt.Errorf("read accounts dir: %w", err)
+		return err
 	}
 	for _, entry := range entries {
 		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
 			continue
 		}
 		path := filepath.Join(dir, entry.Name())
-		data, err := os.ReadFile(path)
+		data, err := readPrivateAccountFile(path)
 		if err != nil {
-			continue
+			return err
 		}
 		var existing map[string]interface{}
 		if err := json.Unmarshal(data, &existing); err != nil {
@@ -463,9 +538,9 @@ func DeleteAccountFile(accountID, dir string) error {
 // DeleteAccountFileByEmail removes the JSON file by email (legacy).
 // Returns AmbiguousEmailError if multiple files match.
 func DeleteAccountFileByEmail(email, dir string) error {
-	entries, err := os.ReadDir(dir)
+	entries, err := readPrivateAccountsDir(dir)
 	if err != nil {
-		return fmt.Errorf("read accounts dir: %w", err)
+		return err
 	}
 	var matches []string
 	for _, entry := range entries {
@@ -473,9 +548,9 @@ func DeleteAccountFileByEmail(email, dir string) error {
 			continue
 		}
 		path := filepath.Join(dir, entry.Name())
-		data, err := os.ReadFile(path)
+		data, err := readPrivateAccountFile(path)
 		if err != nil {
-			continue
+			return err
 		}
 		var existing map[string]interface{}
 		if err := json.Unmarshal(data, &existing); err != nil {
@@ -517,7 +592,8 @@ func HandleAddAccount(pool *AccountPool, accountsDir string, auth *DashboardAuth
 		}
 
 		var body struct {
-			TokenV2 string `json:"token_v2"`
+			TokenV2      string `json:"token_v2"`
+			NotionUserID string `json:"notion_user_id"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			http.Error(w, `{"error":"invalid request body"}`, http.StatusBadRequest)
@@ -532,7 +608,9 @@ func HandleAddAccount(pool *AccountPool, accountsDir string, auth *DashboardAuth
 		log.Printf("[add-account] discovering account from token_v2 (%d chars)...", len(tokenV2))
 
 		// Discover account info
-		acc, err := DiscoverAccountFromToken(tokenV2)
+		acc, err := DiscoverAccountFromTokenWithOptions(tokenV2, AccountDiscoveryOptions{
+			ActiveUserID: strings.TrimSpace(body.NotionUserID),
+		})
 		if err != nil {
 			log.Printf("[add-account] discovery failed: %v", err)
 			w.WriteHeader(http.StatusBadRequest)
