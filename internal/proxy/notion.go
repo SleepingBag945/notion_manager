@@ -1273,10 +1273,13 @@ func resolveFirstTurnInferenceThread(session *Session, attachmentThreadID string
 		if attachmentThreadID != "" && attachmentThreadID != session.ThreadID {
 			return "", false, fmt.Errorf("attachment upload thread %q does not match session thread %q", attachmentThreadID, session.ThreadID)
 		}
-		return session.ThreadID, attachmentThreadID == "", nil
+		// Native Notion still sends createThread=true on the first inference after
+		// an attachment upload initialized the same thread ID. This persists the
+		// initial transcript so the user message and image render in chat history.
+		return session.ThreadID, true, nil
 	}
 	if attachmentThreadID != "" {
-		return attachmentThreadID, false, nil
+		return attachmentThreadID, true, nil
 	}
 	return generateUUIDv4(), true, nil
 }
@@ -1381,13 +1384,14 @@ func CallInference(acc *Account, messages []ChatMessage, model string, disableBu
 		}
 		transcript := buildFullTranscript(acc, messages, notionModel, opt.ReasoningEffort, disableBuiltinTools, enableWebSearch, opt.EnableWorkspaceSearch, opt.UseReadOnlyMode, attachments, configID, contextID, contextPageID, now)
 
-		// When attachments are present, reuse the upload thread instead of creating a new one.
+		// When attachments are present, reuse the upload thread ID. The inference
+		// still creates the first transcript, matching Notion's native workflow.
 		threadID, createThread, err := resolveFirstTurnInferenceThread(session, attachmentThreadID)
 		if err != nil {
 			return err
 		}
-		if !createThread {
-			log.Printf("[upload] using upload thread %s for inference", threadID)
+		if attachmentThreadID != "" {
+			log.Printf("[upload] using upload thread %s for first inference transcript", threadID)
 		}
 
 		reqBody = NotionInferenceRequest{
