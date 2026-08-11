@@ -646,8 +646,13 @@ type quotaApplyResult struct {
 // The returned snapshot describes what changed so the caller can log the
 // transition without re-locking.
 func (p *AccountPool) applyQuotaInfo(acc *Account, info *QuotaInfo) quotaApplyResult {
+	acc.quotaObservationMu.Lock()
 	acc.mu.Lock()
-	defer acc.mu.Unlock()
+	defer func() {
+		acc.mu.Unlock()
+		defer acc.quotaObservationMu.Unlock()
+		logQuotaObservationLocked(acc, info)
+	}()
 	res := quotaApplyResult{WasPermanent: acc.PermanentlyExhausted}
 	now := time.Now()
 	acc.QuotaInfo = cloneQuotaInfo(info)
@@ -1286,17 +1291,30 @@ func saveAccountFile(dir string, acc *Account) error {
 	}
 	if acc.QuotaInfo != nil {
 		existing["quota_info"] = map[string]interface{}{
-			"is_eligible":         acc.QuotaInfo.IsEligible,
-			"space_usage":         acc.QuotaInfo.SpaceUsage,
-			"space_limit":         acc.QuotaInfo.SpaceLimit,
-			"user_usage":          acc.QuotaInfo.UserUsage,
-			"user_limit":          acc.QuotaInfo.UserLimit,
-			"last_usage_at":       acc.QuotaInfo.LastUsageAtMs,
-			"research_mode_usage": acc.QuotaInfo.ResearchModeUsage,
-			"has_premium":         acc.QuotaInfo.HasPremium,
-			"premium_balance":     acc.QuotaInfo.PremiumBalance,
-			"premium_usage":       acc.QuotaInfo.PremiumUsage,
-			"premium_limit":       acc.QuotaInfo.PremiumLimit,
+			"is_eligible":             acc.QuotaInfo.IsEligible,
+			"space_usage":             acc.QuotaInfo.SpaceUsage,
+			"space_limit":             acc.QuotaInfo.SpaceLimit,
+			"user_usage":              acc.QuotaInfo.UserUsage,
+			"user_limit":              acc.QuotaInfo.UserLimit,
+			"last_usage_at":           acc.QuotaInfo.LastUsageAtMs,
+			"research_mode_usage":     acc.QuotaInfo.ResearchModeUsage,
+			"has_premium":             acc.QuotaInfo.HasPremium,
+			"premium_balance":         acc.QuotaInfo.PremiumBalance,
+			"premium_usage":           acc.QuotaInfo.PremiumUsage,
+			"premium_limit":           acc.QuotaInfo.PremiumLimit,
+			"total_credit_balance":    acc.QuotaInfo.TotalCreditBalance,
+			"credits_in_overage":      acc.QuotaInfo.CreditsInOverage,
+			"monthly_allocated_usage": acc.QuotaInfo.MonthlyAllocatedUsage,
+			"monthly_allocated_limit": acc.QuotaInfo.MonthlyAllocatedLimit,
+			"monthly_committed_usage": acc.QuotaInfo.MonthlyCommittedUsage,
+			"monthly_committed_limit": acc.QuotaInfo.MonthlyCommittedLimit,
+			"yearly_elastic_usage":    acc.QuotaInfo.YearlyElasticUsage,
+			"yearly_elastic_limit":    acc.QuotaInfo.YearlyElasticLimit,
+			"v2_space_usage":          acc.QuotaInfo.V2SpaceUsage,
+			"v2_space_limit":          acc.QuotaInfo.V2SpaceLimit,
+			"v2_user_usage":           acc.QuotaInfo.V2UserUsage,
+			"v2_user_limit":           acc.QuotaInfo.V2UserLimit,
+			"v2_last_usage_at":        acc.QuotaInfo.V2LastUsageAtMs,
 		}
 	}
 	if acc.QuotaCheckedAt != nil {
@@ -1454,6 +1472,19 @@ func (p *AccountPool) GetAccountDetails() []map[string]interface{} {
 			entry["premium_balance"] = quota.Info.PremiumBalance
 			entry["premium_usage"] = quota.Info.PremiumUsage
 			entry["premium_limit"] = quota.Info.PremiumLimit
+			entry["total_credit_balance"] = quota.Info.TotalCreditBalance
+			entry["credits_in_overage"] = quota.Info.CreditsInOverage
+			entry["monthly_allocated_usage"] = quota.Info.MonthlyAllocatedUsage
+			entry["monthly_allocated_limit"] = quota.Info.MonthlyAllocatedLimit
+			entry["monthly_committed_usage"] = quota.Info.MonthlyCommittedUsage
+			entry["monthly_committed_limit"] = quota.Info.MonthlyCommittedLimit
+			entry["yearly_elastic_usage"] = quota.Info.YearlyElasticUsage
+			entry["yearly_elastic_limit"] = quota.Info.YearlyElasticLimit
+			entry["v2_space_usage"] = quota.Info.V2SpaceUsage
+			entry["v2_space_limit"] = quota.Info.V2SpaceLimit
+			entry["v2_user_usage"] = quota.Info.V2UserUsage
+			entry["v2_user_limit"] = quota.Info.V2UserLimit
+			entry["v2_last_usage_at"] = quota.Info.V2LastUsageAtMs
 		}
 		if quota.CheckedAt != nil {
 			entry["checked_at"] = quota.CheckedAt.Format(time.RFC3339)
@@ -1548,34 +1579,60 @@ func loadPersistedWorkspace(data []byte, acc *Account) {
 func loadPersistedQuotaInfo(data []byte) *QuotaInfo {
 	var raw struct {
 		QuotaInfo *struct {
-			IsEligible        bool  `json:"is_eligible"`
-			SpaceUsage        int   `json:"space_usage"`
-			SpaceLimit        int   `json:"space_limit"`
-			UserUsage         int   `json:"user_usage"`
-			UserLimit         int   `json:"user_limit"`
-			LastUsageAt       int64 `json:"last_usage_at"`
-			ResearchModeUsage int   `json:"research_mode_usage"`
-			HasPremium        bool  `json:"has_premium"`
-			PremiumBalance    int   `json:"premium_balance"`
-			PremiumUsage      int   `json:"premium_usage"`
-			PremiumLimit      int   `json:"premium_limit"`
+			IsEligible            bool  `json:"is_eligible"`
+			SpaceUsage            int   `json:"space_usage"`
+			SpaceLimit            int   `json:"space_limit"`
+			UserUsage             int   `json:"user_usage"`
+			UserLimit             int   `json:"user_limit"`
+			LastUsageAt           int64 `json:"last_usage_at"`
+			ResearchModeUsage     int   `json:"research_mode_usage"`
+			HasPremium            bool  `json:"has_premium"`
+			PremiumBalance        int   `json:"premium_balance"`
+			PremiumUsage          int   `json:"premium_usage"`
+			PremiumLimit          int   `json:"premium_limit"`
+			TotalCreditBalance    int   `json:"total_credit_balance"`
+			CreditsInOverage      int   `json:"credits_in_overage"`
+			MonthlyAllocatedUsage int   `json:"monthly_allocated_usage"`
+			MonthlyAllocatedLimit int   `json:"monthly_allocated_limit"`
+			MonthlyCommittedUsage int   `json:"monthly_committed_usage"`
+			MonthlyCommittedLimit int   `json:"monthly_committed_limit"`
+			YearlyElasticUsage    int   `json:"yearly_elastic_usage"`
+			YearlyElasticLimit    int   `json:"yearly_elastic_limit"`
+			V2SpaceUsage          int   `json:"v2_space_usage"`
+			V2SpaceLimit          int   `json:"v2_space_limit"`
+			V2UserUsage           int   `json:"v2_user_usage"`
+			V2UserLimit           int   `json:"v2_user_limit"`
+			V2LastUsageAt         int64 `json:"v2_last_usage_at"`
 		} `json:"quota_info"`
 	}
 	if err := json.Unmarshal(data, &raw); err != nil || raw.QuotaInfo == nil {
 		return nil
 	}
 	return &QuotaInfo{
-		IsEligible:        raw.QuotaInfo.IsEligible,
-		SpaceUsage:        raw.QuotaInfo.SpaceUsage,
-		SpaceLimit:        raw.QuotaInfo.SpaceLimit,
-		UserUsage:         raw.QuotaInfo.UserUsage,
-		UserLimit:         raw.QuotaInfo.UserLimit,
-		LastUsageAtMs:     raw.QuotaInfo.LastUsageAt,
-		ResearchModeUsage: raw.QuotaInfo.ResearchModeUsage,
-		HasPremium:        raw.QuotaInfo.HasPremium,
-		PremiumBalance:    raw.QuotaInfo.PremiumBalance,
-		PremiumUsage:      raw.QuotaInfo.PremiumUsage,
-		PremiumLimit:      raw.QuotaInfo.PremiumLimit,
+		IsEligible:            raw.QuotaInfo.IsEligible,
+		SpaceUsage:            raw.QuotaInfo.SpaceUsage,
+		SpaceLimit:            raw.QuotaInfo.SpaceLimit,
+		UserUsage:             raw.QuotaInfo.UserUsage,
+		UserLimit:             raw.QuotaInfo.UserLimit,
+		LastUsageAtMs:         raw.QuotaInfo.LastUsageAt,
+		ResearchModeUsage:     raw.QuotaInfo.ResearchModeUsage,
+		HasPremium:            raw.QuotaInfo.HasPremium,
+		PremiumBalance:        raw.QuotaInfo.PremiumBalance,
+		PremiumUsage:          raw.QuotaInfo.PremiumUsage,
+		PremiumLimit:          raw.QuotaInfo.PremiumLimit,
+		TotalCreditBalance:    raw.QuotaInfo.TotalCreditBalance,
+		CreditsInOverage:      raw.QuotaInfo.CreditsInOverage,
+		MonthlyAllocatedUsage: raw.QuotaInfo.MonthlyAllocatedUsage,
+		MonthlyAllocatedLimit: raw.QuotaInfo.MonthlyAllocatedLimit,
+		MonthlyCommittedUsage: raw.QuotaInfo.MonthlyCommittedUsage,
+		MonthlyCommittedLimit: raw.QuotaInfo.MonthlyCommittedLimit,
+		YearlyElasticUsage:    raw.QuotaInfo.YearlyElasticUsage,
+		YearlyElasticLimit:    raw.QuotaInfo.YearlyElasticLimit,
+		V2SpaceUsage:          raw.QuotaInfo.V2SpaceUsage,
+		V2SpaceLimit:          raw.QuotaInfo.V2SpaceLimit,
+		V2UserUsage:           raw.QuotaInfo.V2UserUsage,
+		V2UserLimit:           raw.QuotaInfo.V2UserLimit,
+		V2LastUsageAtMs:       raw.QuotaInfo.V2LastUsageAt,
 	}
 }
 

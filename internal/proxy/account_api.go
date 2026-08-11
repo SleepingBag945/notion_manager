@@ -441,17 +441,30 @@ func SaveAccountToFile(acc *Account, dir string) (string, error) {
 	}
 	if quota.Info != nil {
 		data["quota_info"] = map[string]interface{}{
-			"is_eligible":         quota.Info.IsEligible,
-			"space_usage":         quota.Info.SpaceUsage,
-			"space_limit":         quota.Info.SpaceLimit,
-			"user_usage":          quota.Info.UserUsage,
-			"user_limit":          quota.Info.UserLimit,
-			"last_usage_at":       quota.Info.LastUsageAtMs,
-			"research_mode_usage": quota.Info.ResearchModeUsage,
-			"has_premium":         quota.Info.HasPremium,
-			"premium_balance":     quota.Info.PremiumBalance,
-			"premium_usage":       quota.Info.PremiumUsage,
-			"premium_limit":       quota.Info.PremiumLimit,
+			"is_eligible":             quota.Info.IsEligible,
+			"space_usage":             quota.Info.SpaceUsage,
+			"space_limit":             quota.Info.SpaceLimit,
+			"user_usage":              quota.Info.UserUsage,
+			"user_limit":              quota.Info.UserLimit,
+			"last_usage_at":           quota.Info.LastUsageAtMs,
+			"research_mode_usage":     quota.Info.ResearchModeUsage,
+			"has_premium":             quota.Info.HasPremium,
+			"premium_balance":         quota.Info.PremiumBalance,
+			"premium_usage":           quota.Info.PremiumUsage,
+			"premium_limit":           quota.Info.PremiumLimit,
+			"total_credit_balance":    quota.Info.TotalCreditBalance,
+			"credits_in_overage":      quota.Info.CreditsInOverage,
+			"monthly_allocated_usage": quota.Info.MonthlyAllocatedUsage,
+			"monthly_allocated_limit": quota.Info.MonthlyAllocatedLimit,
+			"monthly_committed_usage": quota.Info.MonthlyCommittedUsage,
+			"monthly_committed_limit": quota.Info.MonthlyCommittedLimit,
+			"yearly_elastic_usage":    quota.Info.YearlyElasticUsage,
+			"yearly_elastic_limit":    quota.Info.YearlyElasticLimit,
+			"v2_space_usage":          quota.Info.V2SpaceUsage,
+			"v2_space_limit":          quota.Info.V2SpaceLimit,
+			"v2_user_usage":           quota.Info.V2UserUsage,
+			"v2_user_limit":           quota.Info.V2UserLimit,
+			"v2_last_usage_at":        quota.Info.V2LastUsageAtMs,
 		}
 	}
 	if quota.CheckedAt != nil {
@@ -479,7 +492,6 @@ func SaveAccountToFile(acc *Account, dir string) (string, error) {
 // AddAccount adds an account to the pool (hot-load, no restart needed).
 func (p *AccountPool) AddAccount(acc *Account) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	// Check for duplicate by account_id (same user_id + space_id)
 	acc.EnsureAccountID()
 	for i, existing := range p.accounts {
@@ -487,12 +499,20 @@ func (p *AccountPool) AddAccount(acc *Account) {
 		if existing.AccountID != "" && existing.AccountID == acc.AccountID {
 			// Replace existing (same workspace)
 			p.accounts[i] = acc
+			p.mu.Unlock()
 			log.Printf("[account] replaced: %s (%s) aid=%s", acc.UserName, acc.UserEmail, acc.ShortSpaceID())
+			if quota := acc.quotaInfoSnapshot(); quota != nil {
+				logQuotaObservation(acc, nil, quota)
+			}
 			return
 		}
 	}
 	p.accounts = append(p.accounts, acc)
+	p.mu.Unlock()
 	log.Printf("[account] added: %s (%s) [%s]", acc.UserName, acc.UserEmail, acc.PlanType)
+	if quota := acc.quotaInfoSnapshot(); quota != nil {
+		logQuotaObservation(acc, nil, quota)
+	}
 }
 
 // DeleteAccountFile removes the JSON file for an account from the accounts directory.

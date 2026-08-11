@@ -169,6 +169,7 @@ func buildWebSearchCallOptions(requestID string, reasoningEffort string) CallOpt
 		EnableWebSearch: true,
 		ReasoningEffort: reasoningEffort,
 		RequestID:       requestID,
+		ObservationKind: "web_search",
 	}
 }
 
@@ -1273,10 +1274,13 @@ func resolveFirstTurnInferenceThread(session *Session, attachmentThreadID string
 		if attachmentThreadID != "" && attachmentThreadID != session.ThreadID {
 			return "", false, fmt.Errorf("attachment upload thread %q does not match session thread %q", attachmentThreadID, session.ThreadID)
 		}
-		return session.ThreadID, attachmentThreadID == "", nil
+		// Native Notion still sends createThread=true on the first inference after
+		// an attachment upload initialized the same thread ID. This persists the
+		// initial transcript so the user message and image render in chat history.
+		return session.ThreadID, true, nil
 	}
 	if attachmentThreadID != "" {
-		return attachmentThreadID, false, nil
+		return attachmentThreadID, true, nil
 	}
 	return generateUUIDv4(), true, nil
 }
@@ -1299,6 +1303,10 @@ func CallInference(acc *Account, messages []ChatMessage, model string, disableBu
 		opt = opts[0]
 	}
 	requestID := opt.RequestID
+	observationKind := strings.TrimSpace(opt.ObservationKind)
+	if observationKind == "" {
+		observationKind = "workflow"
+	}
 	reasoningEffort, err := normalizeReasoningEffort(opt.ReasoningEffort)
 	if err != nil {
 		return err
@@ -1320,7 +1328,8 @@ func CallInference(acc *Account, messages []ChatMessage, model string, disableBu
 	isResearcher := opt.IsResearcher || IsResearcherModel(model)
 
 	if isResearcher {
-		return callResearcherInference(acc, messages, cb, &opt)
+		opt.ObservationKind = "researcher"
+		return callResearcherInference(acc, messages, model, cb, &opt)
 	}
 
 	notionModel := ResolveModel(model)
@@ -1381,13 +1390,14 @@ func CallInference(acc *Account, messages []ChatMessage, model string, disableBu
 		}
 		transcript := buildFullTranscript(acc, messages, notionModel, opt.ReasoningEffort, disableBuiltinTools, enableWebSearch, opt.EnableWorkspaceSearch, opt.UseReadOnlyMode, attachments, configID, contextID, contextPageID, now)
 
-		// When attachments are present, reuse the upload thread instead of creating a new one.
+		// When attachments are present, reuse the upload thread ID. The inference
+		// still creates the first transcript, matching Notion's native workflow.
 		threadID, createThread, err := resolveFirstTurnInferenceThread(session, attachmentThreadID)
 		if err != nil {
 			return err
 		}
-		if !createThread {
-			log.Printf("[upload] using upload thread %s for inference", threadID)
+		if attachmentThreadID != "" {
+			log.Printf("[upload] using upload thread %s for first inference transcript", threadID)
 		}
 
 		reqBody = NotionInferenceRequest{
@@ -1428,11 +1438,51 @@ func CallInference(acc *Account, messages []ChatMessage, model string, disableBu
 	setNotionHeaders(req, acc)
 
 	client := getChromeHTTPClient(AppConfig.InferenceTimeoutDuration())
+	httpStartedAt := time.Now()
 	resp, err := client.Do(req)
+	headerDuration := time.Since(httpStartedAt)
 	if err != nil {
+		_, workspaceHash, accountHash := observationIdentity(acc)
+		logInferenceObservation("inference_http", map[string]interface{}{
+			"request_id":         requestID,
+			"kind":               observationKind,
+			"model":              model,
+			"notion_model":       notionModel,
+			"workspace_sha256":   workspaceHash,
+			"account_sha256":     accountHash,
+			"trace_sha256":       shortSHA256(reqBody.TraceID),
+			"payload_bytes":      len(bodyBytes),
+			"status":             0,
+			"header_duration_ms": headerDuration.Milliseconds(),
+			"duration_ms":        headerDuration.Milliseconds(),
+			"decoded_bytes":      0,
+			"error_class":        "transport_error",
+		})
 		return fmt.Errorf("send request: %w", err)
 	}
 	defer resp.Body.Close()
+	_, workspaceHash, accountHash := observationIdentity(acc)
+	logHTTPObservation := func(decodedBytes int64, errorClass string) {
+		logInferenceObservation("inference_http", map[string]interface{}{
+			"request_id":         requestID,
+			"kind":               observationKind,
+			"model":              model,
+			"notion_model":       notionModel,
+			"workspace_sha256":   workspaceHash,
+			"account_sha256":     accountHash,
+			"trace_sha256":       shortSHA256(reqBody.TraceID),
+			"payload_bytes":      len(bodyBytes),
+			"status":             resp.StatusCode,
+			"content_type":       resp.Header.Get("Content-Type"),
+			"content_encoding":   resp.Header.Get("Content-Encoding"),
+			"content_length":     resp.ContentLength,
+			"retry_after":        resp.Header.Get("Retry-After"),
+			"header_duration_ms": headerDuration.Milliseconds(),
+			"duration_ms":        time.Since(httpStartedAt).Milliseconds(),
+			"decoded_bytes":      decodedBytes,
+			"error_class":        errorClass,
+		})
+	}
 	LogNotionResponseJSON(requestID, "POST /runInferenceTranscript response meta", map[string]interface{}{
 		"status":           resp.StatusCode,
 		"content_type":     resp.Header.Get("Content-Type"),
@@ -1442,12 +1492,14 @@ func CallInference(acc *Account, messages []ChatMessage, model string, disableBu
 	if resp.StatusCode != 200 {
 		body, _ := io.ReadAll(resp.Body)
 		LogNotionResponseText(requestID, "POST /runInferenceTranscript error body", string(body))
+		logHTTPObservation(int64(len(body)), "http_status")
 		return fmt.Errorf("notion API error %d: %s", resp.StatusCode, string(body[:min(len(body), 500)]))
 	}
 
 	// Decompress
 	reader, cleanup, err := decompressBody(resp)
 	if err != nil {
+		logHTTPObservation(0, "decompress_error")
 		return err
 	}
 	if cleanup != nil {
@@ -1455,7 +1507,21 @@ func CallInference(acc *Account, messages []ChatMessage, model string, disableBu
 	}
 
 	// Parse NDJSON
-	return parseNDJSONStream(reader, requestID, cb, opt.NativeToolUses, opt.ThinkingBlocks, opt.ThinkingCallback, opt.KnownCitationURLs, opt.KnownCitationDocs, opt.KnownToolCallURLs)
+	countedReader := &observationCountingReader{reader: reader}
+	parseObservation := inferenceResponseObservationContext{
+		Kind:            observationKind,
+		Model:           model,
+		NotionModel:     notionModel,
+		WorkspaceSHA256: workspaceHash,
+		AccountSHA256:   accountHash,
+	}
+	parseErr := parseNDJSONStreamObserved(countedReader, requestID, parseObservation, cb, opt.NativeToolUses, opt.ThinkingBlocks, opt.ThinkingCallback, opt.KnownCitationURLs, opt.KnownCitationDocs, opt.KnownToolCallURLs)
+	errorClass := ""
+	if parseErr != nil {
+		errorClass = "ndjson_error"
+	}
+	logHTTPObservation(countedReader.bytes, errorClass)
+	return parseErr
 }
 
 func applyWorkflowRequestProtocol(reqBody *NotionInferenceRequest, createdSource string) {
@@ -1903,6 +1969,10 @@ func CheckQuota(acc *Account) (*QuotaInfo, error) {
 		return nil, fmt.Errorf("parse V2 response: %w", err)
 	}
 
+	return mergeQuotaResponses(v1, v2), nil
+}
+
+func mergeQuotaResponses(v1 quotaV1Response, v2 quotaV2Response) *QuotaInfo {
 	monthlyUsage := v2.PremiumCredits.PerSource.MonthlyAllocated.UsageTotal
 	monthlyLimit := v2.PremiumCredits.PerSource.MonthlyAllocated.Limit
 	premiumRemaining := v2.PremiumCredits.TotalCreditBalance
@@ -1925,13 +1995,28 @@ func CheckQuota(acc *Account) (*QuotaInfo, error) {
 		PremiumBalance: premiumRemaining,
 		PremiumUsage:   monthlyUsage,
 		PremiumLimit:   monthlyLimit,
+		// Preserve the complete V2 snapshot for diagnostics. The legacy fields
+		// above remain aliases of monthlyAllocated/derived balance.
+		TotalCreditBalance:    v2.PremiumCredits.TotalCreditBalance,
+		CreditsInOverage:      v2.PremiumCredits.CreditsInOverage,
+		MonthlyAllocatedUsage: v2.PremiumCredits.PerSource.MonthlyAllocated.UsageTotal,
+		MonthlyAllocatedLimit: v2.PremiumCredits.PerSource.MonthlyAllocated.Limit,
+		MonthlyCommittedUsage: v2.PremiumCredits.PerSource.MonthlyCommitted.UsageTotal,
+		MonthlyCommittedLimit: v2.PremiumCredits.PerSource.MonthlyCommitted.Limit,
+		YearlyElasticUsage:    v2.PremiumCredits.PerSource.YearlyElastic.UsageTotal,
+		YearlyElasticLimit:    v2.PremiumCredits.PerSource.YearlyElastic.Limit,
+		V2SpaceUsage:          v2.BasicCredits.SpaceUsage,
+		V2SpaceLimit:          v2.BasicCredits.SpaceLimit,
+		V2UserUsage:           v2.BasicCredits.UserUsage,
+		V2UserLimit:           v2.BasicCredits.UserLimit,
+		V2LastUsageAtMs:       v2.BasicCredits.LastSpaceUsageAtMs,
 	}
 	info.HasPremium = info.PremiumLimit > 0 ||
 		v2.PremiumCredits.PerSource.MonthlyCommitted.Limit > 0 ||
 		v2.PremiumCredits.PerSource.YearlyElastic.Limit > 0 ||
 		info.PremiumBalance > 0
 
-	return info, nil
+	return info
 }
 
 // CheckUserWorkspace probes /api/v3/loadUserContent and returns the number
@@ -2429,6 +2514,10 @@ func collectSearchResultCitationDocs(evt searchToolResultEvent) []CitationCandid
 }
 
 func parseNDJSONStream(reader io.Reader, requestID string, cb StreamCallback, nativeToolUses *[]AgentValueEntry, thinkingBlocks *[]ThinkingBlock, thinkingCb ThinkingDeltaCallback, knownCitationURLs *[]string, knownCitationDocs *[]CitationCandidate, knownToolCallURLs *map[string][]string) error {
+	return parseNDJSONStreamObserved(reader, requestID, inferenceResponseObservationContext{Kind: "workflow"}, cb, nativeToolUses, thinkingBlocks, thinkingCb, knownCitationURLs, knownCitationDocs, knownToolCallURLs)
+}
+
+func parseNDJSONStreamObserved(reader io.Reader, requestID string, observation inferenceResponseObservationContext, cb StreamCallback, nativeToolUses *[]AgentValueEntry, thinkingBlocks *[]ThinkingBlock, thinkingCb ThinkingDeltaCallback, knownCitationURLs *[]string, knownCitationDocs *[]CitationCandidate, knownToolCallURLs *map[string][]string) (retErr error) {
 	scanner := bufio.NewScanner(reader)
 	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
 	responseLogger := newNotionResponseLogDeduper(requestID, "runInferenceTranscript ndjson deduped")
@@ -2436,7 +2525,12 @@ func parseNDJSONStream(reader io.Reader, requestID string, cb StreamCallback, na
 	var rawText string   // raw accumulated text from Notion
 	var sentClean string // cleaned text already emitted to callback
 	lineCount := 0
+	blankLineCount := 0
+	invalidJSONLineCount := 0
 	eventTypeCounts := make(map[string]int)
+	unknownEventTypeCount := 0
+	unknownEventTypeHashes := make(map[string]int)
+	lastEventType := ""
 	emittedThinkingChars := 0
 
 	// Accumulated usage across multi-turn inference (e.g., web search creates 2 turns)
@@ -2475,6 +2569,53 @@ func parseNDJSONStream(reader io.Reader, requestID string, cb StreamCallback, na
 		}
 		toolCallSearchURLs = *knownToolCallURLs
 	}
+	defer func() {
+		outcome := "empty"
+		switch {
+		case retErr != nil:
+			outcome = "error"
+		case len(sentClean) > 0:
+			outcome = "text"
+		case len(seenNativeToolUseIDs) > 0:
+			outcome = "tool_only"
+		case emittedThinkingChars > 0:
+			outcome = "thinking_only"
+		}
+		errorClass := ""
+		if retErr != nil {
+			switch {
+			case errors.Is(retErr, ErrPremiumFeatureUnavailable):
+				errorClass = "premium_feature_unavailable"
+			case strings.HasPrefix(retErr.Error(), "notion error:"):
+				errorClass = "stream_error_event"
+			default:
+				errorClass = "stream_parse_error"
+			}
+		}
+		logInferenceObservation("ndjson_summary", map[string]interface{}{
+			"request_id":                requestID,
+			"kind":                      observation.Kind,
+			"model":                     observation.Model,
+			"notion_model":              observation.NotionModel,
+			"workspace_sha256":          observation.WorkspaceSHA256,
+			"account_sha256":            observation.AccountSHA256,
+			"outcome":                   outcome,
+			"error_class":               errorClass,
+			"line_count":                lineCount,
+			"blank_line_count":          blankLineCount,
+			"invalid_json_line_count":   invalidJSONLineCount,
+			"event_type_counts":         eventTypeCounts,
+			"unknown_event_type_count":  unknownEventTypeCount,
+			"unknown_event_type_hashes": unknownEventTypeHashes,
+			"terminal_event_type":       lastEventType,
+			"clean_text_chars":          len(sentClean),
+			"thinking_chars":            emittedThinkingChars,
+			"native_tool_use_count":     len(seenNativeToolUseIDs),
+			"search_result_sets":        len(toolCallSearchURLs),
+			"prompt_tokens":             totalUsage.PromptTokens,
+			"completion_tokens":         totalUsage.CompletionTokens,
+		})
+	}()
 	var observedCitationFragments []string
 	var pendingCitationFragment string
 	seenSearchResultSummaries := make(map[string]bool)
@@ -2565,6 +2706,7 @@ func parseNDJSONStream(reader io.Reader, requestID string, cb StreamCallback, na
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" {
+			blankLineCount++
 			continue
 		}
 		lineCount++
@@ -2572,9 +2714,18 @@ func parseNDJSONStream(reader io.Reader, requestID string, cb StreamCallback, na
 
 		var event NDJSONEvent
 		if err := json.Unmarshal([]byte(line), &event); err != nil {
+			invalidJSONLineCount++
 			continue
 		}
-		eventTypeCounts[event.Type]++
+		if isKnownWorkflowNDJSONEventType(event.Type) {
+			eventTypeCounts[event.Type]++
+			lastEventType = event.Type
+		} else {
+			eventTypeCounts["unknown"]++
+			unknownEventTypeCount++
+			recordUnknownEventTypeHash(event.Type, unknownEventTypeHashes)
+			lastEventType = "unknown"
+		}
 
 		switch event.Type {
 		case "premium-feature-unavailable":
@@ -2949,6 +3100,24 @@ func parseNDJSONStream(reader io.Reader, requestID string, cb StreamCallback, na
 		"usage":                 totalUsage,
 	})
 	return nil
+}
+
+func isKnownResearcherNDJSONEventType(eventType string) bool {
+	switch eventType {
+	case "premium-feature-unavailable", "researcher-text-observation", "title", "researcher-next-steps", "researcher-agent", "researcher-report", "error":
+		return true
+	default:
+		return false
+	}
+}
+
+func isKnownWorkflowNDJSONEventType(eventType string) bool {
+	switch eventType {
+	case "premium-feature-unavailable", "agent-tool-result", "agent-search-extracted-results", "agent-inference", "patch", "patch-start", "patch-sync", "record-map", "updated-config", "error":
+		return true
+	default:
+		return false
+	}
 }
 
 // classifyPatchContent determines whether a patch content path belongs to
@@ -3335,7 +3504,7 @@ func formatSearchResultsSummary(results []extractedSearchResult) string {
 // ========== Researcher Mode ==========
 
 // callResearcherInference handles the researcher mode inference call
-func callResearcherInference(acc *Account, messages []ChatMessage, cb StreamCallback, opt *CallOptions) error {
+func callResearcherInference(acc *Account, messages []ChatMessage, model string, cb StreamCallback, opt *CallOptions) error {
 	log.Printf("[researcher] starting research mode inference")
 	requestID := opt.RequestID
 
@@ -3370,11 +3539,34 @@ func callResearcherInference(acc *Account, messages []ChatMessage, cb StreamCall
 	setNotionHeaders(req, acc)
 
 	client := getChromeHTTPClient(AppConfig.ResearchTimeoutDuration())
+	httpStartedAt := time.Now()
 	resp, err := client.Do(req)
+	headerDuration := time.Since(httpStartedAt)
+	_, workspaceHash, accountHash := observationIdentity(acc)
 	if err != nil {
+		logInferenceObservation("inference_http", map[string]interface{}{
+			"request_id": requestID, "kind": "researcher", "model": model,
+			"workspace_sha256": workspaceHash, "account_sha256": accountHash,
+			"trace_sha256": shortSHA256(reqBody.TraceID), "payload_bytes": len(bodyBytes),
+			"status": 0, "header_duration_ms": headerDuration.Milliseconds(),
+			"duration_ms": headerDuration.Milliseconds(), "decoded_bytes": 0,
+			"error_class": "transport_error",
+		})
 		return fmt.Errorf("send researcher request: %w", err)
 	}
 	defer resp.Body.Close()
+	logHTTPObservation := func(decodedBytes int64, errorClass string) {
+		logInferenceObservation("inference_http", map[string]interface{}{
+			"request_id": requestID, "kind": "researcher", "model": model,
+			"workspace_sha256": workspaceHash, "account_sha256": accountHash,
+			"trace_sha256": shortSHA256(reqBody.TraceID), "payload_bytes": len(bodyBytes),
+			"status": resp.StatusCode, "content_type": resp.Header.Get("Content-Type"),
+			"content_encoding": resp.Header.Get("Content-Encoding"), "content_length": resp.ContentLength,
+			"retry_after": resp.Header.Get("Retry-After"), "header_duration_ms": headerDuration.Milliseconds(),
+			"duration_ms": time.Since(httpStartedAt).Milliseconds(), "decoded_bytes": decodedBytes,
+			"error_class": errorClass,
+		})
+	}
 	LogNotionResponseJSON(requestID, "POST /runInferenceTranscript researcher response meta", map[string]interface{}{
 		"status":           resp.StatusCode,
 		"content_type":     resp.Header.Get("Content-Type"),
@@ -3384,18 +3576,31 @@ func callResearcherInference(acc *Account, messages []ChatMessage, cb StreamCall
 	if resp.StatusCode != 200 {
 		body, _ := io.ReadAll(resp.Body)
 		LogNotionResponseText(requestID, "POST /runInferenceTranscript researcher error body", string(body))
+		logHTTPObservation(int64(len(body)), "http_status")
 		return fmt.Errorf("notion researcher API error %d: %s", resp.StatusCode, string(body[:min(len(body), 500)]))
 	}
 
 	reader, cleanup, err := decompressBody(resp)
 	if err != nil {
+		logHTTPObservation(0, "decompress_error")
 		return err
 	}
 	if cleanup != nil {
 		defer cleanup()
 	}
 
-	return parseResearcherStream(reader, requestID, cb, opt.ThinkingBlocks, opt.ThinkingCallback)
+	countedReader := &observationCountingReader{reader: reader}
+	parseObservation := inferenceResponseObservationContext{
+		Kind: "researcher", Model: model,
+		WorkspaceSHA256: workspaceHash, AccountSHA256: accountHash,
+	}
+	parseErr := parseResearcherStreamObserved(countedReader, requestID, parseObservation, cb, opt.ThinkingBlocks, opt.ThinkingCallback)
+	errorClass := ""
+	if parseErr != nil {
+		errorClass = "ndjson_error"
+	}
+	logHTTPObservation(countedReader.bytes, errorClass)
+	return parseErr
 }
 
 // buildResearcherTranscript builds the minimal transcript for researcher mode.
@@ -3466,6 +3671,10 @@ func buildResearcherTranscript(acc *Account, messages []ChatMessage) []interface
 // Thinking deltas are emitted incrementally via thinkingCb so the client sees
 // research progress in real-time instead of waiting for the report to start.
 func parseResearcherStream(reader io.Reader, requestID string, cb StreamCallback, thinkingBlocks *[]ThinkingBlock, thinkingCb ThinkingDeltaCallback) error {
+	return parseResearcherStreamObserved(reader, requestID, inferenceResponseObservationContext{Kind: "researcher"}, cb, thinkingBlocks, thinkingCb)
+}
+
+func parseResearcherStreamObserved(reader io.Reader, requestID string, observation inferenceResponseObservationContext, cb StreamCallback, thinkingBlocks *[]ThinkingBlock, thinkingCb ThinkingDeltaCallback) (retErr error) {
 	scanner := bufio.NewScanner(reader)
 	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
 	responseLogger := newNotionResponseLogDeduper(requestID, "runInferenceTranscript researcher ndjson deduped")
@@ -3474,7 +3683,12 @@ func parseResearcherStream(reader io.Reader, requestID string, cb StreamCallback
 	var thinkingContent string // accumulated thinking content (for non-stream/fallback)
 	var totalReportLen int     // total accumulated report text length
 	lineCount := 0
+	blankLineCount := 0
+	invalidJSONLineCount := 0
 	eventTypeCounts := make(map[string]int)
+	unknownEventTypeCount := 0
+	unknownEventTypeHashes := make(map[string]int)
+	lastEventType := ""
 	thinkingDone := false                      // whether we've signaled thinking is complete
 	stepNames := make(map[string]string)       // step key → display name from next-steps
 	stepSearchTypes := make(map[string]string) // step key → search type (internal/web)
@@ -3483,6 +3697,39 @@ func parseResearcherStream(reader io.Reader, requestID string, cb StreamCallback
 	// contain FULL text (not incremental), while researcher-report events ARE true deltas.
 	lastOutputByID := make(map[string]string)    // step ID → last seen output thinking content
 	lastRawOutputByID := make(map[string]string) // step ID → last seen rawOutput thinking content
+	defer func() {
+		outcome := "empty"
+		switch {
+		case retErr != nil:
+			outcome = "error"
+		case totalReportLen > 0:
+			outcome = "text"
+		case len(thinkingContent) > 0:
+			outcome = "thinking_only"
+		}
+		errorClass := ""
+		if retErr != nil {
+			switch {
+			case errors.Is(retErr, ErrResearchQuotaExhausted):
+				errorClass = "research_quota_exhausted"
+			case strings.HasPrefix(retErr.Error(), "notion researcher error:"):
+				errorClass = "stream_error_event"
+			default:
+				errorClass = "stream_parse_error"
+			}
+		}
+		logInferenceObservation("ndjson_summary", map[string]interface{}{
+			"request_id": requestID, "kind": observation.Kind, "model": observation.Model,
+			"notion_model": observation.NotionModel, "workspace_sha256": observation.WorkspaceSHA256,
+			"account_sha256": observation.AccountSHA256, "outcome": outcome, "error_class": errorClass,
+			"line_count": lineCount, "blank_line_count": blankLineCount,
+			"invalid_json_line_count": invalidJSONLineCount, "event_type_counts": eventTypeCounts,
+			"unknown_event_type_count": unknownEventTypeCount, "unknown_event_type_hashes": unknownEventTypeHashes,
+			"terminal_event_type": lastEventType,
+			"thinking_chars":      len(thinkingContent), "report_chars": totalReportLen,
+			"report_events": reportEventCount, "step_count": len(stepNames),
+		})
+	}()
 
 	// Buffered report emitter: strips [step-xxx,artifact,N] citation tags.
 	// Since tags can be split across streaming deltas, we buffer text after
@@ -3549,6 +3796,7 @@ func parseResearcherStream(reader io.Reader, requestID string, cb StreamCallback
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" {
+			blankLineCount++
 			continue
 		}
 		lineCount++
@@ -3556,9 +3804,18 @@ func parseResearcherStream(reader io.Reader, requestID string, cb StreamCallback
 
 		var event NDJSONEvent
 		if err := json.Unmarshal([]byte(line), &event); err != nil {
+			invalidJSONLineCount++
 			continue
 		}
-		eventTypeCounts[event.Type]++
+		if isKnownResearcherNDJSONEventType(event.Type) {
+			eventTypeCounts[event.Type]++
+			lastEventType = event.Type
+		} else {
+			eventTypeCounts["unknown"]++
+			unknownEventTypeCount++
+			recordUnknownEventTypeHash(event.Type, unknownEventTypeHashes)
+			lastEventType = "unknown"
+		}
 
 		switch event.Type {
 		case "premium-feature-unavailable":

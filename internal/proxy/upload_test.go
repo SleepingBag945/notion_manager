@@ -109,11 +109,16 @@ func TestUploadedAttachmentThreadIDRequiresOneSharedThread(t *testing.T) {
 func TestResolveFirstTurnInferenceThreadReusesUploadThread(t *testing.T) {
 	session := &Session{ThreadID: "thread-shared"}
 	threadID, createThread, err := resolveFirstTurnInferenceThread(session, "thread-shared")
-	if err != nil || threadID != session.ThreadID || createThread {
+	if err != nil || threadID != session.ThreadID || !createThread {
 		t.Fatalf("resolved first-turn attachment thread = %q, create=%v, err=%v", threadID, createThread, err)
 	}
 	if inferenceCreatedSource(true) != "workflows" {
 		t.Fatalf("attachment createdSource = %q, want workflows", inferenceCreatedSource(true))
+	}
+
+	threadID, createThread, err = resolveFirstTurnInferenceThread(nil, "thread-upload")
+	if err != nil || threadID != "thread-upload" || !createThread {
+		t.Fatalf("resolved legacy first-turn attachment thread = %q, create=%v, err=%v", threadID, createThread, err)
 	}
 
 	threadID, createThread, err = resolveFirstTurnInferenceThread(session, "")

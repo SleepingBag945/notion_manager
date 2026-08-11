@@ -740,10 +740,51 @@ func handlePremiumFeatureUnavailable(pool *AccountPool, acc *Account) {
 	log.Printf("[premium] %s premium feature unavailable, trying next account", acc.UserEmail)
 }
 
+type emptyWorkspaceAttempt struct {
+	acc     *Account
+	attempt int
+}
+
+type emptyWorkspaceAttempts map[string]emptyWorkspaceAttempt
+
+func (attempts emptyWorkspaceAttempts) record(acc *Account, attempt int) {
+	attempts[acc.SpaceID] = emptyWorkspaceAttempt{acc: acc, attempt: attempt}
+}
+
+func (attempts emptyWorkspaceAttempts) abort(pool *AccountPool, requestID, model string, exceptSpaceID *string) {
+	for spaceID, emptyAttempt := range attempts {
+		if exceptSpaceID != nil && spaceID == *exceptSpaceID {
+			continue
+		}
+		pool.ObserveInferenceRequestAborted(emptyAttempt.acc, requestID, model)
+		delete(attempts, spaceID)
+	}
+}
+
+func (attempts emptyWorkspaceAttempts) observeSuccess(pool *AccountPool, acc *Account, requestID, model string, attempt, total, payloadBytes int, duration time.Duration) {
+	successSpaceID := acc.SpaceID
+	attempts.abort(pool, requestID, model, &successSpaceID)
+	pool.ObserveInferenceSuccess(acc, requestID, model, attempt, total, payloadBytes, duration)
+}
+
+func (attempts emptyWorkspaceAttempts) observeRequestEmpty(pool *AccountPool, requestID, model string, total, payloadBytes int, duration time.Duration) {
+	for _, emptyAttempt := range attempts {
+		pool.ObserveInferenceRequestEmpty(emptyAttempt.acc, requestID, model, emptyAttempt.attempt, total, payloadBytes, duration)
+	}
+}
+
 // HandleAnthropicMessages returns an HTTP handler for the /v1/messages endpoint (Anthropic Messages API)
 func HandleAnthropicMessages(pool *AccountPool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		w, responseObservation := newObservationResponseWriter(w)
+		requestStartedAt := time.Now()
 		requestID := "msg_" + generateUUIDv4()
+		requestMetadata, ok := r.Context().Value(inferenceObservationSourceKey).(inferenceRequestObservationMetadata)
+		if !ok {
+			requestMetadata = inferenceRequestObservationMetadata{SourceAPI: "messages", CorrelationID: requestID}
+		}
+		registerInferenceRequestObservation(requestID, requestMetadata)
+		defer unregisterInferenceRequestObservation(requestID)
 
 		if r.Method != http.MethodPost {
 			writeAnthropicError(w, requestID, http.StatusMethodNotAllowed, "method not allowed", "invalid_request_error")
@@ -935,6 +976,7 @@ func HandleAnthropicMessages(pool *AccountPool) http.HandlerFunc {
 		maxAttempts := pool.Count()
 		var lastNonQuotaErr error
 		var sawEmptyResponse bool
+		emptyWorkspaces := make(emptyWorkspaceAttempts)
 		var toolRecoveryMessages []ChatMessage
 		toolBridgeRetried := false
 		liveCheckInterval := AppConfig.QuotaLiveCheckInterval()
@@ -1055,6 +1097,14 @@ func HandleAnthropicMessages(pool *AccountPool) http.HandlerFunc {
 
 			log.Printf("[req] %s model=%s messages=%d stream=%v tools=%d attachments=%d account=%s session=%v (attempt %d/%d) [anthropic]",
 				requestID, model, len(req.Messages), req.Stream, len(req.Tools), len(fileAttachments), acc.UserEmail, !isFirstTurn, attempt+1, maxAttempts)
+			if !isResearcher {
+				pool.ObserveInferenceAttemptStart(acc, requestID, model, attempt+1, maxAttempts, len(bodyBytes))
+			}
+			abortObservedAttempt := func() {
+				if !isResearcher {
+					pool.ObserveInferenceAttemptAborted(acc, requestID, model)
+				}
+			}
 
 			// Upload file attachments to Notion (if any) — skip for researcher mode
 			var uploadedAttachments []UploadedAttachment
@@ -1067,6 +1117,8 @@ func HandleAnthropicMessages(pool *AccountPool) http.HandlerFunc {
 					uploaded, err := UploadFileToNotionThread(acc, &fa, target.ThreadID, target.CreateThread)
 					if err != nil {
 						log.Printf("[upload] %s: attachment %d upload failed: %v", requestID, i+1, err)
+						abortObservedAttempt()
+						emptyWorkspaces.abort(pool, requestID, model, nil)
 						writeAnthropicError(w, requestID, http.StatusBadGateway, "file upload failed: "+err.Error(), "api_error")
 						return
 					}
@@ -1078,6 +1130,7 @@ func HandleAnthropicMessages(pool *AccountPool) http.HandlerFunc {
 			// For streaming responses, default to emitting thinking blocks even when
 			// the client did not explicitly request Anthropic thinking.
 			hasThinking := req.Thinking != nil || req.Stream
+			attemptStartedAt := time.Now()
 			var reqErr error
 			if isResearcher {
 				// Researcher mode — always use thinking blocks for research progress
@@ -1092,6 +1145,7 @@ func HandleAnthropicMessages(pool *AccountPool) http.HandlerFunc {
 			} else {
 				reqErr = handleAnthropicNonStream(w, acc, requestMessages, model, requestID, hasTools, hasThinking, enableWebSearch, enableWorkspaceSearch, useReadOnlyMode, uploadedAttachments, req.OutputConfig, currentSession)
 			}
+			attemptDuration := time.Since(attemptStartedAt)
 
 			// Trigger an async live quota refresh after every call so the next
 			// selection has up-to-date numbers. Deduplicated per account so
@@ -1099,6 +1153,7 @@ func HandleAnthropicMessages(pool *AccountPool) http.HandlerFunc {
 			pool.RefreshAccountQuotaAsync(acc)
 
 			if reqErr != nil && errors.Is(reqErr, ErrResearchQuotaExhausted) {
+				abortObservedAttempt()
 				// Research mode quota exhausted — account can still serve normal chat
 				quota := acc.quotaInfoSnapshot()
 				log.Printf("[research-quota] %s research quota exhausted (research_usage=%d), trying next account",
@@ -1111,6 +1166,7 @@ func HandleAnthropicMessages(pool *AccountPool) http.HandlerFunc {
 				continue
 			}
 			if reqErr != nil && errors.Is(reqErr, ErrQuotaExhausted) {
+				abortObservedAttempt()
 				if isFreePlan(acc) {
 					log.Printf("[quota] %s (free plan) quota exhausted — disabling permanently", acc.UserEmail)
 				} else {
@@ -1132,7 +1188,9 @@ func HandleAnthropicMessages(pool *AccountPool) http.HandlerFunc {
 			if reqErr != nil && errors.Is(reqErr, ErrEmptyResponse) {
 				// Empty response — account/thread in bad state, clear session and try next account
 				log.Printf("[empty] %s returned empty response, trying next account", acc.UserEmail)
+				pool.ObserveInferenceAttemptEmpty(acc, requestID, model, attempt+1, maxAttempts, len(bodyBytes), attemptDuration)
 				sawEmptyResponse = true
+				emptyWorkspaces.record(acc, attempt+1)
 				if currentSession != nil {
 					globalSessionManager.Delete(fingerprint)
 					session = nil
@@ -1144,6 +1202,7 @@ func HandleAnthropicMessages(pool *AccountPool) http.HandlerFunc {
 
 			if reqErr != nil && errors.Is(reqErr, ErrToolBridgeNoTool) {
 				if !toolBridgeRetried {
+					abortObservedAttempt()
 					log.Printf("[bridge] %s returned no-tool identity-drift text, clearing session and retrying once with sanitized recovery prompt", acc.UserEmail)
 					toolBridgeRetried = true
 					if fingerprint != "" {
@@ -1161,6 +1220,7 @@ func HandleAnthropicMessages(pool *AccountPool) http.HandlerFunc {
 			}
 
 			if reqErr != nil && errors.Is(reqErr, ErrPremiumFeatureUnavailable) {
+				abortObservedAttempt()
 				// Premium feature unavailable — for free accounts this means quota is permanently gone
 				handlePremiumFeatureUnavailable(pool, acc)
 				if !isFirstTurn && session != nil {
@@ -1175,6 +1235,7 @@ func HandleAnthropicMessages(pool *AccountPool) http.HandlerFunc {
 			if reqErr != nil {
 				// Non-quota error — if this was a subsequent turn, try clearing session and retrying as first turn
 				if !isFirstTurn && session != nil {
+					abortObservedAttempt()
 					log.Printf("[session] subsequent turn failed (%v), clearing session and falling back to first turn", reqErr)
 					globalSessionManager.Delete(fingerprint)
 					session = nil
@@ -1208,16 +1269,29 @@ func HandleAnthropicMessages(pool *AccountPool) http.HandlerFunc {
 						currentSession.ThreadID, currentSession.TurnCount, rawMsgCount)
 				}
 			}
+			if reqErr == nil && !isResearcher {
+				if status := responseObservation.StatusCode(); status >= http.StatusOK && status < http.StatusBadRequest {
+					emptyWorkspaces.observeSuccess(pool, acc, requestID, model, attempt+1, maxAttempts, len(bodyBytes), attemptDuration)
+				} else {
+					abortObservedAttempt()
+					emptyWorkspaces.abort(pool, requestID, model, nil)
+				}
+			} else {
+				abortObservedAttempt()
+				emptyWorkspaces.abort(pool, requestID, model, nil)
+			}
 
 			return
 		}
 
 		if lastNonQuotaErr != nil {
+			emptyWorkspaces.abort(pool, requestID, model, nil)
 			writeAnthropicError(w, requestID, http.StatusBadGateway,
 				"notion API error: "+lastNonQuotaErr.Error(), "api_error")
 			return
 		}
 		if sawEmptyResponse {
+			emptyWorkspaces.observeRequestEmpty(pool, requestID, model, maxAttempts, len(bodyBytes), time.Since(requestStartedAt))
 			writeAnthropicError(w, requestID, http.StatusBadGateway,
 				"notion returned empty response after retries", "api_error")
 			return

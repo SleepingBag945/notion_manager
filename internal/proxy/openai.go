@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
@@ -902,6 +903,9 @@ func HandleOpenAIChatCompletions(pool *AccountPool) http.HandlerFunc {
 		}
 
 		respID := "chatcmpl_" + compactUUID()
+		r = r.WithContext(context.WithValue(r.Context(), inferenceObservationSourceKey, inferenceRequestObservationMetadata{
+			SourceAPI: "chat_completions", CorrelationID: respID,
+		}))
 		created := time.Now().Unix()
 		if req.Stream {
 			streamAnthropicAsOpenAIChat(w, r, anthropicHandler, anthReq, respID, created, req.StreamOptions != nil && req.StreamOptions.IncludeUsage)
@@ -953,6 +957,9 @@ func HandleOpenAIResponses(pool *AccountPool) http.HandlerFunc {
 		}
 
 		respID := "resp_" + compactUUID()
+		r = r.WithContext(context.WithValue(r.Context(), inferenceObservationSourceKey, inferenceRequestObservationMetadata{
+			SourceAPI: "responses", CorrelationID: respID,
+		}))
 		created := time.Now().Unix()
 		if req.Stream {
 			streamAnthropicAsOpenAIResponses(w, r, anthropicHandler, anthReq, respID, created, toolAliases)
@@ -973,6 +980,11 @@ func HandleOpenAIResponses(pool *AccountPool) http.HandlerFunc {
 }
 
 func streamAnthropicAsOpenAIChat(w http.ResponseWriter, r *http.Request, anthropicHandler http.HandlerFunc, anthropicReq *AnthropicRequest, responseID string, created int64, includeUsage bool) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeOpenAIError(w, http.StatusInternalServerError, "streaming not supported", "api_error", "")
+		return
+	}
 	bridge := newAnthropicStreamBridgeWriter()
 	innerReq, err := newAnthropicBridgeRequest(r, anthropicReq)
 	if err != nil {
@@ -984,11 +996,6 @@ func streamAnthropicAsOpenAIChat(w http.ResponseWriter, r *http.Request, anthrop
 		bridge.Close()
 	}()
 
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		writeOpenAIError(w, http.StatusInternalServerError, "streaming not supported", "api_error", "")
-		return
-	}
 	transcoder := newOpenAIChatStreamTranscoder(w, flusher, responseID, anthropicReq.Model, created, includeUsage)
 	headersSent := false
 	frameCount := 0
@@ -1023,6 +1030,11 @@ func streamAnthropicAsOpenAIChat(w http.ResponseWriter, r *http.Request, anthrop
 }
 
 func streamAnthropicAsOpenAIResponses(w http.ResponseWriter, r *http.Request, anthropicHandler http.HandlerFunc, anthropicReq *AnthropicRequest, responseID string, created int64, toolAliases map[string]openAIToolIdentity) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeOpenAIError(w, http.StatusInternalServerError, "streaming not supported", "api_error", "")
+		return
+	}
 	bridge := newAnthropicStreamBridgeWriter()
 	innerReq, err := newAnthropicBridgeRequest(r, anthropicReq)
 	if err != nil {
@@ -1034,11 +1046,6 @@ func streamAnthropicAsOpenAIResponses(w http.ResponseWriter, r *http.Request, an
 		bridge.Close()
 	}()
 
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		writeOpenAIError(w, http.StatusInternalServerError, "streaming not supported", "api_error", "")
-		return
-	}
 	transcoder := newOpenAIResponsesStreamTranscoder(w, flusher, responseID, anthropicReq.Model, created, toolAliases)
 	headersSent := false
 	frameCount := 0
